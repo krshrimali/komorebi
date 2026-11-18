@@ -3300,6 +3300,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "komorebi-overview"
+version = "0.1.0"
+dependencies = [
+ "komorebi-client",
+ "serde_json_lenient",
+ "windows 0.62.2",
+ "windows-core 0.62.2",
+ "windows-numerics 0.3.1",
+]
+
+[[package]]
 name = "komorebi-shortcuts"
 version = "0.1.0"
 dependencies = [

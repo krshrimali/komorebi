@@ -18,3 +18,9 @@ if (-not (Get-Process whkd -ErrorAction SilentlyContinue)) {
 if (-not (Get-Process komorebi-bar -ErrorAction SilentlyContinue)) {
     Start-Process komorebi-bar -WindowStyle Hidden
 }
+
+# Workspace overview (Alt+Q): stays resident so it opens instantly
+$overview = Join-Path $PSScriptRoot 'komorebi-overview.exe'
+if ((Test-Path $overview) -and -not (Get-Process komorebi-overview -ErrorAction SilentlyContinue)) {
+    Start-Process $overview -ArgumentList '--daemon'
+}

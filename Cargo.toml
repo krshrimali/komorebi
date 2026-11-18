@@ -11,6 +11,7 @@ members = [
   "komorebi-bar",
   "komorebi-themes",
   "komorebi-shortcuts",
+  "komorebi-overview",
 ]
 
 [workspace.dependencies]

@@ -8,7 +8,7 @@ $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [En
 
 Push-Location $repo
 try {
-    cargo +stable-x86_64-pc-windows-gnu build --release -p komorebi
+    cargo +stable-x86_64-pc-windows-gnu build --release -p komorebi -p komorebi-overview
     if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
 } finally {
     Pop-Location
@@ -24,7 +24,9 @@ if ($wasRunning) {
     Get-Process komorebi -ErrorAction SilentlyContinue | Wait-Process -Timeout 15 -ErrorAction SilentlyContinue
 }
 
+Get-Process komorebi-overview -ErrorAction SilentlyContinue | Stop-Process -Force
 Copy-Item (Join-Path $repo 'target\release\komorebi.exe') (Join-Path $dest 'komorebi.exe') -Force
+Copy-Item (Join-Path $repo 'target\release\komorebi-overview.exe') (Join-Path $dest 'komorebi-overview.exe') -Force
 Copy-Item (Join-Path $PSScriptRoot 'start.ps1') (Join-Path $dest 'start.ps1') -Force
 
 # Autostart: replace the stock komorebic shortcut with the custom launcher
