@@ -541,6 +541,9 @@ pub struct StaticConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "schemars", schemars(extend("default" = DEFAULT_MOUSE_FOLLOWS_FOCUS)))]
     pub mouse_follows_focus: Option<bool>,
+    /// Hyprland-style modifier + mouse drag to move and resize windows
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mouse_drag: Option<crate::mouse_drag::MouseDragConfig>,
     /// Path to applications.json from komorebi-application-specific-configurations
     #[serde(skip_serializing_if = "Option::is_none")]
     pub app_specific_configuration_path: Option<AppSpecificConfigurationPath>,
@@ -887,6 +890,7 @@ impl From<&WindowManager> for StaticConfig {
             #[allow(deprecated)]
             focus_follows_mouse: value.focus_follows_mouse,
             mouse_follows_focus: Option::from(value.mouse_follows_focus),
+            mouse_drag: None,
             app_specific_configuration_path: None,
             border_width: Option::from(border_manager::BORDER_WIDTH.load(Ordering::SeqCst)),
             border_offset: Option::from(border_manager::BORDER_OFFSET.load(Ordering::SeqCst)),
@@ -1258,6 +1262,8 @@ impl StaticConfig {
         if let Some(behaviour) = self.window_handling_behaviour {
             WINDOW_HANDLING_BEHAVIOUR.store(behaviour);
         }
+
+        crate::mouse_drag::apply(self.mouse_drag.as_ref());
 
         Ok(())
     }
