@@ -547,6 +547,9 @@ pub struct StaticConfig {
     /// Float dialogs, owned windows and fixed-size windows instead of tiling them (default: false)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub float_dialogs: Option<bool>,
+    /// Focus/cycle workspace commands always target the monitor under the cursor (default: false)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_follows_cursor: Option<bool>,
     /// Path to applications.json from komorebi-application-specific-configurations
     #[serde(skip_serializing_if = "Option::is_none")]
     pub app_specific_configuration_path: Option<AppSpecificConfigurationPath>,
@@ -895,6 +898,9 @@ impl From<&WindowManager> for StaticConfig {
             mouse_follows_focus: Option::from(value.mouse_follows_focus),
             mouse_drag: None,
             float_dialogs: Option::from(window::FLOAT_DIALOGS.load(Ordering::SeqCst)),
+            workspace_follows_cursor: Option::from(
+                window::WORKSPACE_FOLLOWS_CURSOR.load(Ordering::SeqCst),
+            ),
             app_specific_configuration_path: None,
             border_width: Option::from(border_manager::BORDER_WIDTH.load(Ordering::SeqCst)),
             border_offset: Option::from(border_manager::BORDER_OFFSET.load(Ordering::SeqCst)),
@@ -1269,6 +1275,10 @@ impl StaticConfig {
 
         crate::mouse_drag::apply(self.mouse_drag.as_ref());
         window::FLOAT_DIALOGS.store(self.float_dialogs.unwrap_or(false), Ordering::SeqCst);
+        window::WORKSPACE_FOLLOWS_CURSOR.store(
+            self.workspace_follows_cursor.unwrap_or(false),
+            Ordering::SeqCst,
+        );
 
         Ok(())
     }

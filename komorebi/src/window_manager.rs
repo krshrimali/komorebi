@@ -3850,6 +3850,63 @@ impl WindowManager {
     /// Updates the list of `known_hwnds` and their monitor/workspace index pair
     ///
     /// [`known_hwnds`]: `Self.known_hwnds`
+    /// Removes a window from whichever workspace holds it, not just the focused one.
+    /// Returns false if no workspace knows the window.
+    ///
+    /// Windows that are minimized or destroyed while another monitor (or workspace) has
+    /// focus would otherwise stay behind as empty tiles.
+    pub fn remove_window_anywhere(&mut self, hwnd: isize) -> eyre::Result<bool> {
+        if self.focused_workspace()?.contains_window(hwnd) {
+            self.focused_workspace_mut()?.remove_window(hwnd)?;
+            self.update_focused_workspace(false, false)?;
+            return Ok(true);
+        }
+
+        let indexed = self
+            .known_hwnds
+            .get(&hwnd)
+            .copied()
+            .filter(|(m_idx, w_idx)| {
+                self.monitors()
+                    .get(*m_idx)
+                    .and_then(|m| m.workspaces().get(*w_idx))
+                    .is_some_and(|w| w.contains_window(hwnd))
+            });
+
+        let location = indexed.or_else(|| {
+            self.monitors().iter().enumerate().find_map(|(m_idx, monitor)| {
+                monitor
+                    .workspaces()
+                    .iter()
+                    .position(|w| w.contains_window(hwnd))
+                    .map(|w_idx| (m_idx, w_idx))
+            })
+        });
+
+        let Some((m_idx, w_idx)) = location else {
+            return Ok(false);
+        };
+
+        let monitor = self
+            .monitors_mut()
+            .get_mut(m_idx)
+            .ok_or_eyre("there is no monitor")?;
+        let visible = monitor.focused_workspace_idx() == w_idx;
+        monitor
+            .workspaces_mut()
+            .get_mut(w_idx)
+            .ok_or_eyre("there is no workspace")?
+            .remove_window(hwnd)?;
+
+        tracing::info!("removed window {hwnd} from monitor {m_idx}, workspace {w_idx}");
+
+        if visible {
+            self.update_focused_workspace_by_monitor_idx(m_idx)?;
+        }
+
+        Ok(true)
+    }
+
     pub fn update_known_hwnds(&mut self) {
         tracing::trace!("updating list of known hwnds");
         let mut known_hwnds = HashMap::new();

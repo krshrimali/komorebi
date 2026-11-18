@@ -327,75 +327,42 @@ impl DefaultLayout {
 
         let mut r = resize.unwrap_or_default();
 
-        let resize_delta = delta;
+        // Adjustments are in resize units; the default layouts apply roughly half
+        // of an adjustment to the visible edge. Keep every tile at least
+        // MIN_TILE_SIZE pixels wide/tall, instead of the old limit of half the
+        // tile's unaltered size, which stopped mouse drags short.
+        //
+        // The old checks also tested a different value than the one they applied
+        // for Up (Increase tested `top + delta` but applied `top - delta`), so
+        // after a large top-edge resize the edge could never be moved back. And
+        // a step that would cross the limit was dropped entirely instead of
+        // stopping at the limit.
+        //
+        // Note: the limit cannot account for changes made to adjacent containers,
+        // so callers that can (like mouse_drag) should also validate the result.
+        const MIN_TILE_SIZE: i32 = 100;
+        let width_limit = (unaltered.right - MIN_TILE_SIZE).max(0) * 2;
+        let height_limit = (unaltered.bottom - MIN_TILE_SIZE).max(0) * 2;
+
+        let change = match sizing {
+            Sizing::Increase => delta,
+            Sizing::Decrease => -delta,
+        };
 
         match edge {
-            OperationDirection::Left => match sizing {
-                Sizing::Increase => {
-                    // Some final checks to make sure the user can't infinitely resize to
-                    // the point of pushing other windows out of bounds
-
-                    // Note: These checks cannot take into account the changes made to the
-                    // edges of adjacent windows at operation time, so it is still possible
-                    // to push windows out of bounds by maxing out an Increase Left on a
-                    // Window with index 1, and then maxing out a Decrease Right on a Window
-                    // with index 0. I don't think it's worth trying to defensively program
-                    // against this; if people end up in this situation they are better off
-                    // just hitting the retile command
-                    let diff = ((r.left + -resize_delta) as f32).abs();
-                    if diff < unaltered.right as f32 {
-                        r.left += -resize_delta;
-                    }
-                }
-                Sizing::Decrease => {
-                    let diff = ((r.left - -resize_delta) as f32).abs();
-                    if diff < unaltered.right as f32 {
-                        r.left -= -resize_delta;
-                    }
-                }
-            },
-            OperationDirection::Up => match sizing {
-                Sizing::Increase => {
-                    let diff = ((r.top + resize_delta) as f32).abs();
-                    if diff < unaltered.bottom as f32 {
-                        r.top += -resize_delta;
-                    }
-                }
-                Sizing::Decrease => {
-                    let diff = ((r.top - resize_delta) as f32).abs();
-                    if diff < unaltered.bottom as f32 {
-                        r.top -= -resize_delta;
-                    }
-                }
-            },
-            OperationDirection::Right => match sizing {
-                Sizing::Increase => {
-                    let diff = ((r.right + resize_delta) as f32).abs();
-                    if diff < unaltered.right as f32 {
-                        r.right += resize_delta;
-                    }
-                }
-                Sizing::Decrease => {
-                    let diff = ((r.right - resize_delta) as f32).abs();
-                    if diff < unaltered.right as f32 {
-                        r.right -= resize_delta;
-                    }
-                }
-            },
-            OperationDirection::Down => match sizing {
-                Sizing::Increase => {
-                    let diff = ((r.bottom + resize_delta) as f32).abs();
-                    if diff < unaltered.bottom as f32 {
-                        r.bottom += resize_delta;
-                    }
-                }
-                Sizing::Decrease => {
-                    let diff = ((r.bottom - resize_delta) as f32).abs();
-                    if diff < unaltered.bottom as f32 {
-                        r.bottom -= resize_delta;
-                    }
-                }
-            },
+            // Growing to the left/up means a more negative left/top adjustment
+            OperationDirection::Left => {
+                r.left = bounded_adjustment(r.left, -change, width_limit);
+            }
+            OperationDirection::Up => {
+                r.top = bounded_adjustment(r.top, -change, height_limit);
+            }
+            OperationDirection::Right => {
+                r.right = bounded_adjustment(r.right, change, width_limit);
+            }
+            OperationDirection::Down => {
+                r.bottom = bounded_adjustment(r.bottom, change, height_limit);
+            }
         };
 
         if r.eq(&Rect::default()) {
@@ -439,3 +406,17 @@ impl DefaultLayout {
 #[cfg(test)]
 #[path = "default_layout_tests.rs"]
 mod tests;
+
+/// Apply `change` to a resize adjustment, clamping its magnitude to `limit`.
+/// A change that moves the adjustment back towards zero is always allowed, so a
+/// resize can always be undone.
+const fn bounded_adjustment(current: i32, change: i32, limit: i32) -> i32 {
+    let next = current + change;
+    if next.abs() <= limit || next.abs() <= current.abs() {
+        next
+    } else if next < 0 {
+        -limit
+    } else {
+        limit
+    }
+}

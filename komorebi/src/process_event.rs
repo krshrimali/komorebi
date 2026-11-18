@@ -268,10 +268,7 @@ impl WindowManager {
                 self.has_pending_raise_op = false;
             }
             WindowManagerEvent::Destroy(_, window) | WindowManagerEvent::Unmanage(window) => {
-                if self.focused_workspace()?.contains_window(window.hwnd) {
-                    self.focused_workspace_mut()?.remove_window(window.hwnd)?;
-                    self.update_focused_workspace(false, false)?;
-
+                if self.remove_window_anywhere(window.hwnd)? {
                     let mut already_moved_window_handles = self.already_moved_window_handles.lock();
 
                     already_moved_window_handles.remove(&window.hwnd);
@@ -302,8 +299,7 @@ impl WindowManager {
                     }
 
                     if hide {
-                        self.focused_workspace_mut()?.remove_window(window.hwnd)?;
-                        self.update_focused_workspace(false, false)?;
+                        self.remove_window_anywhere(window.hwnd)?;
                     }
                 }
             }
@@ -411,6 +407,13 @@ impl WindowManager {
                 {
                     tracing::info!("ignoring uncloak after monocle move by mouse across monitors");
                     self.uncloack_to_ignore = self.uncloack_to_ignore.saturating_sub(1);
+                } else if !matches!(event, WindowManagerEvent::Manage(_)) && window.is_miminized()
+                {
+                    // Windows can fire SystemMinimizeEnd (and Show/Uncloak) for a window that
+                    // is still iconic, e.g. when ShowWindow(SW_MINIMIZE) is called on an
+                    // already-minimized window. Tiling it would leave an empty hole in the
+                    // layout, and no Minimize event follows to remove it again.
+                    tracing::info!("ignoring {event} for a window that is still minimized");
                 } else {
                     let focused_monitor_idx = self.focused_monitor_idx();
                     let focused_workspace_idx =

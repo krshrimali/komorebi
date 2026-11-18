@@ -63,6 +63,10 @@ use windows::Win32::Foundation::HWND;
 pub static MINIMUM_WIDTH: AtomicI32 = AtomicI32::new(0);
 pub static MINIMUM_HEIGHT: AtomicI32 = AtomicI32::new(0);
 
+/// Workspace focus commands act on the monitor under the cursor (Hyprland follow_mouse)
+pub static WORKSPACE_FOLLOWS_CURSOR: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Hyprland-style automatic floating of dialogs and fixed-size windows
 pub static FLOAT_DIALOGS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);

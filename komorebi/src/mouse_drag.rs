@@ -610,7 +610,10 @@ fn drive_edge(
     target: i32,
     gain: &mut f32,
 ) {
-    for _ in 0..4 {
+    // Set once a step had to be undone; from then on steps are bisected
+    let mut limit: Option<i32> = None;
+
+    for _ in 0..8 {
         let Some(current) = layout_edge(wm, hwnd, monitor_idx, direction) else {
             return;
         };
@@ -631,11 +634,33 @@ fn drive_edge(
         };
 
         #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
-        let amount = ((error.abs() as f32) / *gain).round().max(1.0) as i32;
+        let mut amount = ((error.abs() as f32) / *gain).round().max(1.0) as i32;
+        if let Some(limit) = limit {
+            amount = amount.min(limit);
+        }
+        if amount < 2 {
+            return;
+        }
+
+        let saved = wm
+            .focused_workspace()
+            .map(|w| w.resize_dimensions.clone())
+            .unwrap_or_default();
 
         if let Err(error) = wm.resize_window(direction, sizing, amount, true) {
             tracing::debug!("mouse drag resize step failed: {error}");
             return;
+        }
+
+        // The layout's own bound can't see how adjacent tiles are affected, so
+        // check every tile; if any got too small, undo and try a smaller step
+        if !layout_is_sane(wm) {
+            if let Ok(workspace) = wm.focused_workspace_mut() {
+                workspace.resize_dimensions = saved;
+            }
+            let _ = wm.update_focused_workspace(false, false);
+            limit = Some(amount / 2);
+            continue;
         }
 
         let Some(after) = layout_edge(wm, hwnd, monitor_idx, direction) else {
@@ -653,6 +678,23 @@ fn drive_edge(
             *gain = (moved as f32 / amount as f32).clamp(0.05, 8.0);
         }
     }
+}
+
+/// Every tile on the focused workspace is at least MIN_SIZE and inside the work area
+fn layout_is_sane(wm: &WindowManager) -> bool {
+    let Ok(workspace) = wm.focused_workspace() else {
+        return true;
+    };
+
+    let area = workspace.globals.work_area;
+    workspace.latest_layout.iter().all(|r| {
+        r.right >= MIN_SIZE
+            && r.bottom >= MIN_SIZE
+            && r.left >= area.left - 2
+            && r.top >= area.top - 2
+            && r.left + r.right <= area.left + area.right + 2
+            && r.top + r.bottom <= area.top + area.bottom + 2
+    })
 }
 
 /// Pick which edge of an axis to drag: the one nearest the cursor, unless it
