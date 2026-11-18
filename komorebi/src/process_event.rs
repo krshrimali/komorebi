@@ -603,6 +603,10 @@ impl WindowManager {
                 *pending_move_op = Option::from((monitor_idx, workspace_idx, window.hwnd));
             }
             WindowManagerEvent::MoveResizeEnd(_, window) => {
+                // A mouse_drag move tells us it was a move: the size heuristic below
+                // misfires when a window can't fit its tile or changes DPI on drop
+                let op_hint = crate::mouse_drag::take_move_hint();
+
                 // We need this because if the event ends on a different monitor,
                 // that monitor will already have been focused and updated in the state
                 let pending = *self.pending_move_op;
@@ -697,7 +701,8 @@ impl WindowManager {
                     // if a move has taken place by ruling out a resize
                     let right_bottom_constant = 0;
 
-                    let is_move = moved_across_monitors
+                    let is_move = op_hint
+                        || moved_across_monitors
                         || resize.right.abs() == right_bottom_constant
                             && resize.bottom.abs() == right_bottom_constant;
 
