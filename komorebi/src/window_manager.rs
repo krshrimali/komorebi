@@ -1744,11 +1744,25 @@ impl WindowManager {
         tracing::info!("moving container");
 
         let mouse_follows_focus = self.mouse_follows_focus;
+        let offset = self.work_area_offset;
         let monitor = self
             .focused_monitor_mut()
             .ok_or_eyre("there is no monitor")?;
+        let origin_idx = monitor.focused_workspace_idx();
 
         monitor.move_container_to_workspace(idx, follow, direction)?;
+
+        // When focus follows the window, the workspace it left is hidden next
+        // and would keep the gap until it is shown again (then visibly
+        // resizing). Retile it now so it is already laid out on return.
+        if monitor.focused_workspace_idx() != origin_idx {
+            let offset = monitor.work_area_offset.or(offset);
+            monitor.update_workspace_globals(origin_idx, offset);
+            if let Some(origin) = monitor.workspaces_mut().get_mut(origin_idx) {
+                origin.update()?;
+            }
+        }
+
         monitor.load_focused_workspace(mouse_follows_focus)?;
 
         self.update_focused_workspace(mouse_follows_focus, true)?;
