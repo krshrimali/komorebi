@@ -666,6 +666,13 @@ fn handle_floating_borders(
     forced_update: bool,
 ) -> color_eyre::Result<()> {
     for window in ws.floating_windows() {
+        // No border around fullscreen windows (games, video): it would only
+        // bleed onto the neighbouring monitors
+        if WindowsApi::covers_monitor(window.hwnd) {
+            remove_border(&window.hwnd.to_string(), borders, windows_borders)?;
+            continue;
+        }
+
         let mut new_border = false;
         let id = window.hwnd.to_string();
         let border = match borders.entry(id.clone()) {

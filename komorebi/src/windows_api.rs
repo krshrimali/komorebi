@@ -442,6 +442,21 @@ impl WindowsApi {
                 for hwnd in windows_on_other_monitors {
                     workspace.remove_window(hwnd)?;
                 }
+
+                // Windows matching a floating rule (or the dialog heuristic) join the
+                // workspace as floating windows, untouched, so they follow workspace
+                // switches like every other window instead of being tiled
+                let floating = workspace
+                    .containers()
+                    .iter()
+                    .flat_map(|c| c.windows().iter().copied())
+                    .filter(|w| w.should_float())
+                    .collect::<Vec<_>>();
+
+                for window in floating {
+                    workspace.remove_window(window.hwnd)?;
+                    workspace.floating_windows_mut().push_back(window);
+                }
             }
         }
 
@@ -1072,6 +1087,24 @@ impl WindowsApi {
 
     pub fn is_zoomed(hwnd: isize) -> bool {
         unsafe { IsZoomed(HWND(as_ptr!(hwnd))) }.into()
+    }
+
+    /// True if the window covers its entire monitor (borderless/exclusive fullscreen,
+    /// e.g. games and video players)
+    pub fn covers_monitor(hwnd: isize) -> bool {
+        let Ok(rect) = Self::window_rect(hwnd) else {
+            return false;
+        };
+        let hmonitor = HMONITOR(as_ptr!(Self::monitor_from_window(hwnd)));
+        let Ok(info) = Self::monitor_info_w(hmonitor) else {
+            return false;
+        };
+        let m = info.monitorInfo.rcMonitor;
+
+        rect.left <= m.left
+            && rect.top <= m.top
+            && rect.left + rect.right >= m.right
+            && rect.top + rect.bottom >= m.bottom
     }
 
     pub fn monitor_info_w(hmonitor: HMONITOR) -> eyre::Result<MONITORINFOEXW> {

@@ -35,10 +35,9 @@ pub extern "system" fn enum_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
 
         if let Ok(should_manage) = window.should_manage(None, &mut RuleDebug::default())
             && should_manage
-            // Dialog-like windows open at startup are left floating, not tiled
-            && !window.should_auto_float()
         {
-            if is_maximized {
+            // Floating windows are split out of the tiles by load_workspace_information
+            if is_maximized && !window.should_float() {
                 WindowsApi::restore_window(window.hwnd);
             }
 

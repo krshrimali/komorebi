@@ -612,6 +612,33 @@ impl Window {
     /// tiling, like Hyprland does for dialogs and transient windows:
     /// standard dialogs (`#32770`), windows owned by another visible window,
     /// and windows that cannot be maximized or resized. Manage rules win.
+    /// Should this window be managed as floating: matches a floating rule, or
+    /// the dialog heuristic (`should_auto_float`)
+    pub fn should_float(self) -> bool {
+        if self.should_auto_float() {
+            return true;
+        }
+
+        let (Ok(title), Ok(exe_name), Ok(class), Ok(path)) =
+            (self.title(), self.exe(), self.class(), self.path())
+        else {
+            return false;
+        };
+
+        // Same lock order as window_is_eligible to avoid deadlocks
+        let regex_identifiers = REGEX_IDENTIFIERS.lock();
+        let floating_identifiers = FLOATING_APPLICATIONS.lock();
+        should_act(
+            &title,
+            &exe_name,
+            &class,
+            &path,
+            &floating_identifiers,
+            &regex_identifiers,
+        )
+        .is_some()
+    }
+
     pub fn should_auto_float(self) -> bool {
         if !FLOAT_DIALOGS.load(Ordering::SeqCst) {
             return false;
