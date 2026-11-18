@@ -55,6 +55,7 @@ use windows::Win32::UI::WindowsAndMessaging::GetMessageW;
 use windows::Win32::UI::WindowsAndMessaging::GetShellWindow;
 use windows::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW;
 use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
+use windows::Win32::UI::WindowsAndMessaging::IsHungAppWindow;
 use windows::Win32::UI::WindowsAndMessaging::IsZoomed;
 use windows::Win32::UI::WindowsAndMessaging::LLMHF_INJECTED;
 use windows::Win32::UI::WindowsAndMessaging::MSG;
@@ -271,36 +272,36 @@ fn modifier_down() -> bool {
 }
 
 /// Returns the top-level window under the point if it can be dragged
-fn draggable_window_at(pt: POINT) -> Option<HWND> {
+fn draggable_window_at(pt: POINT) -> Result<HWND, String> {
     unsafe {
         let hwnd = windows::Win32::UI::WindowsAndMessaging::WindowFromPoint(pt);
         if hwnd.is_invalid() {
-            return None;
+            return Err("no window under the cursor".into());
         }
 
         let root = GetAncestor(hwnd, GA_ROOT);
         if root.is_invalid() || root == GetDesktopWindow() || root == GetShellWindow() {
-            return None;
+            return Err(format!("root {:?} is the desktop/shell", root.0));
         }
 
         // Only real application windows: skips the taskbar, desktop icon
         // host, tooltips and other caption-less surfaces
         let style = GetWindowLongPtrW(root, GWL_STYLE) as u32;
         if style & WS_CHILD.0 != 0 || style & (WS_CAPTION.0 | WS_THICKFRAME.0) == 0 {
-            return None;
+            return Err(format!("root {} has style {style:#010x}", root.0 as isize));
         }
 
         if IsZoomed(root).as_bool() {
-            return None;
+            return Err(format!("root {} is maximized", root.0 as isize));
         }
 
         if let Ok(exe) = Window::from(root.0 as isize).exe()
             && IGNORED_EXES.iter().any(|i| i.eq_ignore_ascii_case(&exe))
         {
-            return None;
+            return Err(format!("root {} belongs to {exe}", root.0 as isize));
         }
 
-        Some(root)
+        Ok(root)
     }
 }
 
@@ -366,18 +367,21 @@ fn handle_mouse(msg: u32, pt: POINT) -> bool {
         return false;
     }
 
-    let Some(hwnd) = draggable_window_at(pt) else {
-        let under = unsafe { windows::Win32::UI::WindowsAndMessaging::WindowFromPoint(pt) };
-        let window = Window::from(under.0 as isize);
-        tracing::info!(
-            "mouse drag: nothing draggable at {},{} (hwnd {}, class {}, exe {})",
-            pt.x,
-            pt.y,
-            window.hwnd,
-            window.class().unwrap_or_default(),
-            window.exe().unwrap_or_default()
-        );
-        return false;
+    let hwnd = match draggable_window_at(pt) {
+        Ok(hwnd) => hwnd,
+        Err(reason) => {
+            let under = unsafe { windows::Win32::UI::WindowsAndMessaging::WindowFromPoint(pt) };
+            let window = Window::from(under.0 as isize);
+            tracing::info!(
+                "mouse drag: nothing draggable at {},{}: {reason} (hit hwnd {}, class {}, exe {})",
+                pt.x,
+                pt.y,
+                window.hwnd,
+                window.class().unwrap_or_default(),
+                window.exe().unwrap_or_default()
+            );
+            return false;
+        }
     };
 
     ACTIVE_BUTTON.set(button);
@@ -560,7 +564,14 @@ impl Drag {
 
     fn motion(&mut self, x: i32, y: i32) {
         if !self.is_tiled_resize() {
-            self.apply_window(x, y, true);
+            // Synchronous: wait for the app to apply each position. Motion queued
+            // meanwhile is coalesced by the worker, so the window always jumps to
+            // the latest cursor position instead of replaying a backlog of
+            // posted moves (which made it trail the cursor by hundreds of px).
+            // Hung apps get the async variant so the drag never freezes.
+            let hung = unsafe { IsHungAppWindow(HWND(self.hwnd as *mut core::ffi::c_void)) }
+                .as_bool();
+            self.apply_window(x, y, hung);
             return;
         }
 
