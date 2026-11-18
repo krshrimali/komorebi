@@ -544,6 +544,9 @@ pub struct StaticConfig {
     /// Hyprland-style modifier + mouse drag to move and resize windows
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mouse_drag: Option<crate::mouse_drag::MouseDragConfig>,
+    /// Float dialogs, owned windows and fixed-size windows instead of tiling them (default: false)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub float_dialogs: Option<bool>,
     /// Path to applications.json from komorebi-application-specific-configurations
     #[serde(skip_serializing_if = "Option::is_none")]
     pub app_specific_configuration_path: Option<AppSpecificConfigurationPath>,
@@ -891,6 +894,7 @@ impl From<&WindowManager> for StaticConfig {
             focus_follows_mouse: value.focus_follows_mouse,
             mouse_follows_focus: Option::from(value.mouse_follows_focus),
             mouse_drag: None,
+            float_dialogs: Option::from(window::FLOAT_DIALOGS.load(Ordering::SeqCst)),
             app_specific_configuration_path: None,
             border_width: Option::from(border_manager::BORDER_WIDTH.load(Ordering::SeqCst)),
             border_offset: Option::from(border_manager::BORDER_OFFSET.load(Ordering::SeqCst)),
@@ -1264,6 +1268,7 @@ impl StaticConfig {
         }
 
         crate::mouse_drag::apply(self.mouse_drag.as_ref());
+        window::FLOAT_DIALOGS.store(self.float_dialogs.unwrap_or(false), Ordering::SeqCst);
 
         Ok(())
     }

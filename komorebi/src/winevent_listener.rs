@@ -1,5 +1,4 @@
 use std::sync::OnceLock;
-use std::time::Duration;
 
 use crossbeam_channel::Receiver;
 use crossbeam_channel::Sender;
@@ -38,6 +37,10 @@ pub fn start() {
 
             let mut msg: MSG = MSG::default();
 
+            // GetMessageW blocks until the next event, so no sleep is needed here.
+            // Sleeping after every message capped delivery at ~100 events/s, and
+            // a retile (especially an animated one) produces far more than that,
+            // so Show/Destroy events queued up behind it and layouts lagged.
             loop {
                 unsafe {
                     if !GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -48,15 +51,14 @@ pub fn start() {
                     let _ = TranslateMessage(&msg);
                     DispatchMessageW(&msg);
                 }
-
-                std::thread::sleep(Duration::from_millis(10))
             }
         })
     });
 }
 
 fn channel() -> &'static (Sender<WindowManagerEvent>, Receiver<WindowManagerEvent>) {
-    CHANNEL.get_or_init(|| crossbeam_channel::bounded(20))
+    // Large enough that a burst of events never blocks the WinEvent hook thread
+    CHANNEL.get_or_init(|| crossbeam_channel::bounded(1024))
 }
 
 pub fn event_tx() -> Sender<WindowManagerEvent> {

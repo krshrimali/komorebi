@@ -290,6 +290,8 @@ fn main() -> eyre::Result<()> {
         )?))
     };
 
+    komorebi::mouse_drag::set_window_manager(wm.clone());
+
     wm.lock().init()?;
 
     if let Some(config) = &static_config {

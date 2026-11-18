@@ -69,6 +69,8 @@ pub fn listen_for_events(wm: Arc<Mutex<WindowManager>>) {
         tracing::info!("listening");
         loop {
             if let Ok(event) = receiver.recv() {
+                let started = std::time::Instant::now();
+                let title = event.title();
                 let mut guard = wm.lock();
                 match guard.process_event(event) {
                     Ok(()) => {}
@@ -79,6 +81,16 @@ pub fn listen_for_events(wm: Arc<Mutex<WindowManager>>) {
                             tracing::error!("{}", error)
                         }
                     }
+                }
+                drop(guard);
+
+                let elapsed = started.elapsed();
+                if elapsed.as_millis() >= 50 {
+                    tracing::warn!("slow event: {title} took {}ms to process", elapsed.as_millis());
+                }
+
+                if receiver.len() >= 64 {
+                    tracing::warn!("event backlog: {} events queued", receiver.len());
                 }
             }
         }
@@ -474,10 +486,11 @@ impl WindowManager {
                         let monocle_container = workspace.monocle_container.clone();
 
                         if !workspace_contains_window && needs_reconciliation.is_none() {
+                            let auto_float = window.should_auto_float();
                             let floating_applications = FLOATING_APPLICATIONS.lock();
-                            let mut should_float = false;
+                            let mut should_float = auto_float;
 
-                            if !floating_applications.is_empty() {
+                            if !should_float && !floating_applications.is_empty() {
                                 let regex_identifiers = REGEX_IDENTIFIERS.lock();
 
                                 if let (Ok(title), Ok(exe_name), Ok(class), Ok(path)) =

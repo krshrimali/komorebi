@@ -63,6 +63,10 @@ use windows::Win32::Foundation::HWND;
 pub static MINIMUM_WIDTH: AtomicI32 = AtomicI32::new(0);
 pub static MINIMUM_HEIGHT: AtomicI32 = AtomicI32::new(0);
 
+/// Hyprland-style automatic floating of dialogs and fixed-size windows
+pub static FLOAT_DIALOGS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 #[derive(Debug, Default, Clone, Copy, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct Window {
@@ -598,6 +602,65 @@ impl Window {
 
     pub fn is_focused(self) -> bool {
         WindowsApi::foreground_window().unwrap_or_default() == self.hwnd
+    }
+
+    /// When `float_dialogs` is enabled, dialog-like windows float instead of
+    /// tiling, like Hyprland does for dialogs and transient windows:
+    /// standard dialogs (`#32770`), windows owned by another visible window,
+    /// and windows that cannot be maximized or resized. Manage rules win.
+    pub fn should_auto_float(self) -> bool {
+        if !FLOAT_DIALOGS.load(Ordering::SeqCst) {
+            return false;
+        }
+
+        let (Ok(title), Ok(exe_name), Ok(class), Ok(path), Ok(style)) = (
+            self.title(),
+            self.exe(),
+            self.class(),
+            self.path(),
+            self.style(),
+        ) else {
+            return false;
+        };
+
+        {
+            // Same lock order as window_is_eligible to avoid deadlocks
+            let regex_identifiers = REGEX_IDENTIFIERS.lock();
+            let manage_identifiers = MANAGE_IDENTIFIERS.lock();
+            if should_act(
+                &title,
+                &exe_name,
+                &class,
+                &path,
+                &manage_identifiers,
+                &regex_identifiers,
+            )
+            .is_some()
+            {
+                return false;
+            }
+        }
+
+        if class == "#32770" {
+            return true;
+        }
+
+        if !style.contains(WindowStyle::MAXIMIZEBOX) || !style.contains(WindowStyle::THICKFRAME) {
+            return true;
+        }
+
+        use windows::Win32::UI::WindowsAndMessaging::GW_OWNER;
+        use windows::Win32::UI::WindowsAndMessaging::GetWindow;
+        use windows::Win32::UI::WindowsAndMessaging::IsWindowVisible;
+
+        if let Ok(owner) = unsafe { GetWindow(HWND(self.hwnd as *mut core::ffi::c_void), GW_OWNER) }
+            && !owner.is_invalid()
+            && unsafe { IsWindowVisible(owner) }.as_bool()
+        {
+            return true;
+        }
+
+        false
     }
 
     pub fn transparent(self) -> eyre::Result<()> {

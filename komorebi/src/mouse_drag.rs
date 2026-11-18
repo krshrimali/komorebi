@@ -4,19 +4,27 @@
 //! and release are swallowed so the click never reaches the application, and a
 //! worker thread moves/resizes the window under the cursor as the mouse moves.
 //!
-//! At the start and end of a drag, synthetic `MoveResizeStart` and
-//! `MoveResizeEnd` events are pushed into komorebi's normal event channel, so
-//! the existing logic that handles native title-bar drags (container swaps,
-//! cross-monitor moves, resize ratio updates) is reused unchanged.
+//! Drags are reported to the window manager as `MoveResizeStart` and
+//! `MoveResizeEnd` events, so the existing logic that handles native title-bar
+//! drags (container swaps, cross-monitor moves, resize ratio updates) is reused.
+//!
+//! Tiled windows are resized live: while dragging, the layout is periodically
+//! updated so neighbouring tiles follow the cursor, like Hyprland. Edges with
+//! no neighbouring tile are never picked, so a resize always does something.
 
 use std::cell::Cell;
+use std::num::NonZeroUsize;
+use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU8;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
+use std::time::Instant;
 
 use crossbeam_channel::Receiver;
 use crossbeam_channel::Sender;
+use parking_lot::Mutex;
 use serde::Deserialize;
 use serde::Serialize;
 use windows::Win32::Foundation::HWND;
@@ -70,22 +78,39 @@ use windows::Win32::UI::WindowsAndMessaging::WS_CHILD;
 use windows::Win32::UI::WindowsAndMessaging::WS_THICKFRAME;
 
 use crate::Window;
+use crate::animation::ANIMATION_ENABLED_GLOBAL;
+use crate::core::Layout;
+use crate::core::OperationDirection;
+use crate::window_manager::WindowManager;
 use crate::window_manager_event::WindowManagerEvent;
 use crate::winevent::WinEvent;
 use crate::winevent_listener;
+use crate::workspace::WorkspaceLayer;
 
 /// Smallest width/height a window can be resized down to with the mouse
 const MIN_SIZE: i32 = 100;
+
+/// How often the tiling layout is recomputed during a live resize
+const LIVE_RESIZE_INTERVAL: Duration = Duration::from_millis(33);
 
 /// An unassigned virtual key, tapped while Win is held so that releasing Win
 /// after a drag does not open the Start menu
 const VK_DUMMY: u16 = 0xE8;
 
+/// Processes whose windows must never be dragged
+const IGNORED_EXES: &[&str] = &["komorebi-bar.exe", "komorebi.exe"];
+
 pub static MOUSE_DRAG_ENABLED: AtomicBool = AtomicBool::new(false);
+static LIVE_RESIZE: AtomicBool = AtomicBool::new(true);
 static MODIFIER: AtomicU8 = AtomicU8::new(MouseDragModifier::Win as u8);
 static MOVE_BUTTON: AtomicU8 = AtomicU8::new(MouseDragButton::Left as u8);
 static RESIZE_BUTTON: AtomicU8 = AtomicU8::new(MouseDragButton::Right as u8);
 
+/// Testing aid: also react to synthetic (injected) mouse input when
+/// `KOMOREBI_MOUSE_DRAG_ALLOW_INJECTED=1` is set in the environment
+static ALLOW_INJECTED: OnceLock<bool> = OnceLock::new();
+
+static WM: OnceLock<Arc<Mutex<WindowManager>>> = OnceLock::new();
 static CHANNEL: OnceLock<(Sender<DragMessage>, Receiver<DragMessage>)> = OnceLock::new();
 static HOOK_THREAD: OnceLock<std::thread::JoinHandle<()>> = OnceLock::new();
 static WORKER_THREAD: OnceLock<std::thread::JoinHandle<()>> = OnceLock::new();
@@ -130,9 +155,18 @@ pub struct MouseDragConfig {
     /// Mouse button that moves the window under the cursor (default: Left)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub move_button: Option<MouseDragButton>,
-    /// Mouse button that resizes the window under the cursor from the nearest corner (default: Right)
+    /// Mouse button that resizes the window under the cursor (default: Right)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resize_button: Option<MouseDragButton>,
+    /// Re-tile neighbouring windows while resizing a tiled window (default: true)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub live_resize: Option<bool>,
+}
+
+/// Give the drag worker direct access to the window manager, so drags are
+/// processed synchronously instead of racing other queued events
+pub fn set_window_manager(wm: Arc<Mutex<WindowManager>>) {
+    let _ = WM.set(wm);
 }
 
 /// Apply (or re-apply on config reload) the mouse drag configuration.
@@ -150,6 +184,7 @@ pub fn apply(config: Option<&MouseDragConfig>) {
             config.resize_button.unwrap_or(MouseDragButton::Right) as u8,
             Ordering::SeqCst,
         );
+        LIVE_RESIZE.store(config.live_resize.unwrap_or(true), Ordering::SeqCst);
     }
 
     MOUSE_DRAG_ENABLED.store(enabled, Ordering::SeqCst);
@@ -177,6 +212,10 @@ fn channel() -> &'static (Sender<DragMessage>, Receiver<DragMessage>) {
 }
 
 fn start() {
+    ALLOW_INJECTED.get_or_init(|| {
+        std::env::var("KOMOREBI_MOUSE_DRAG_ALLOW_INJECTED").is_ok_and(|v| v == "1")
+    });
+
     WORKER_THREAD.get_or_init(|| std::thread::spawn(worker));
 
     HOOK_THREAD.get_or_init(|| {
@@ -197,8 +236,8 @@ fn start() {
 }
 
 // ---------------------------------------------------------------------------
-// Hook thread: must stay fast, so it only decides whether to swallow input
-// and forwards points to the worker.
+// Hook thread: must stay fast and must never lock the window manager. It only
+// decides whether to swallow input and forwards points to the worker.
 // ---------------------------------------------------------------------------
 
 thread_local! {
@@ -233,14 +272,20 @@ fn draggable_window_at(pt: POINT) -> Option<HWND> {
             return None;
         }
 
-        // Only real application windows: skips the taskbar, bars, desktop
-        // icon host, tooltips and other caption-less surfaces
+        // Only real application windows: skips the taskbar, desktop icon
+        // host, tooltips and other caption-less surfaces
         let style = GetWindowLongPtrW(root, GWL_STYLE) as u32;
         if style & WS_CHILD.0 != 0 || style & (WS_CAPTION.0 | WS_THICKFRAME.0) == 0 {
             return None;
         }
 
         if IsZoomed(root).as_bool() {
+            return None;
+        }
+
+        if let Ok(exe) = Window::from(root.0 as isize).exe()
+            && IGNORED_EXES.iter().any(|i| i.eq_ignore_ascii_case(&exe))
+        {
             return None;
         }
 
@@ -321,8 +366,10 @@ fn handle_mouse(msg: u32, pt: POINT) -> bool {
 unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code >= 0 {
         let info = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
-        // Ignore synthetic input (including our own and komorebi's focus nudges)
-        if info.flags & LLMHF_INJECTED == 0 && handle_mouse(wparam.0 as u32, info.pt) {
+        // Ignore synthetic input (including komorebi's own focus nudges)
+        let injected = info.flags & LLMHF_INJECTED != 0;
+        let allow_injected = *ALLOW_INJECTED.get().unwrap_or(&false);
+        if (!injected || allow_injected) && handle_mouse(wparam.0 as u32, info.pt) {
             return LRESULT(1);
         }
     }
@@ -334,15 +381,29 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
 // Worker thread: focuses, moves and resizes windows, and talks to komorebi.
 // ---------------------------------------------------------------------------
 
+/// Which edges of a tiled container have a neighbour that can absorb a resize
+#[derive(Copy, Clone, Debug)]
+struct ResizableEdges {
+    left: bool,
+    right: bool,
+    up: bool,
+    down: bool,
+}
+
 struct Drag {
     hwnd: isize,
     op: DragOp,
     origin: POINT,
     rect: RECT,
-    /// Which horizontal edge a resize drags: -1 left, 1 right
+    /// Which horizontal edge a resize drags: -1 left, 1 right, 0 locked
     edge_x: i32,
-    /// Which vertical edge a resize drags: -1 top, 1 bottom
+    /// Which vertical edge a resize drags: -1 top, 1 bottom, 0 locked
     edge_y: i32,
+    /// The window is a tiled container in the focused workspace of its monitor
+    tiled: bool,
+    last_live_update: Instant,
+    /// Global animation setting to restore once the drag is over
+    restore_animation: Option<bool>,
 }
 
 impl Drag {
@@ -359,16 +420,16 @@ impl Drag {
                 r.bottom += dy;
             }
             DragOp::Resize => {
-                if self.edge_x < 0 {
-                    r.left = (r.left + dx).min(r.right - MIN_SIZE);
-                } else {
-                    r.right = (r.right + dx).max(r.left + MIN_SIZE);
+                match self.edge_x {
+                    -1 => r.left = (r.left + dx).min(r.right - MIN_SIZE),
+                    1 => r.right = (r.right + dx).max(r.left + MIN_SIZE),
+                    _ => {}
                 }
 
-                if self.edge_y < 0 {
-                    r.top = (r.top + dy).min(r.bottom - MIN_SIZE);
-                } else {
-                    r.bottom = (r.bottom + dy).max(r.top + MIN_SIZE);
+                match self.edge_y {
+                    -1 => r.top = (r.top + dy).min(r.bottom - MIN_SIZE),
+                    1 => r.bottom = (r.bottom + dy).max(r.top + MIN_SIZE),
+                    _ => {}
                 }
             }
         }
@@ -396,6 +457,114 @@ impl Drag {
             )
         };
     }
+
+    fn live_resize(&mut self, x: i32, y: i32) {
+        if self.op != DragOp::Resize
+            || !self.tiled
+            || !LIVE_RESIZE.load(Ordering::Relaxed)
+            || self.last_live_update.elapsed() < LIVE_RESIZE_INTERVAL
+        {
+            self.apply(x, y, true);
+            return;
+        }
+
+        self.last_live_update = Instant::now();
+
+        // The window must actually be at the target before komorebi measures it
+        self.apply(x, y, false);
+
+        // Commit this step of the resize to the layout so neighbouring tiles
+        // follow, then immediately reopen the drag for the next step
+        let window = Window::from(self.hwnd);
+        process(WindowManagerEvent::MoveResizeEnd(
+            WinEvent::SystemMoveSizeEnd,
+            window,
+        ));
+        process(WindowManagerEvent::MoveResizeStart(
+            WinEvent::SystemMoveSizeStart,
+            window,
+        ));
+    }
+}
+
+/// Pick which edge of an axis to drag: the one nearest the cursor, unless it
+/// has no neighbour to push against, in which case the opposite edge is used
+const fn pick_edge(near_negative: bool, negative_ok: bool, positive_ok: bool) -> i32 {
+    match (near_negative, negative_ok, positive_ok) {
+        (true, true, _) | (false, true, false) => -1,
+        (false, _, true) | (true, false, true) => 1,
+        _ => 0,
+    }
+}
+
+/// If `hwnd` is a tiled container on the focused workspace of its monitor,
+/// focus that monitor and container in komorebi's state (so the drag acts on
+/// the right container, without waiting for the OS focus event) and return
+/// which of its edges can be resized.
+fn prepare_tiled(wm: &mut WindowManager, hwnd: isize) -> Option<ResizableEdges> {
+    let (monitor_idx, container_idx) = wm.monitors().iter().enumerate().find_map(|(m, monitor)| {
+        let workspace = monitor.focused_workspace()?;
+        if !workspace.tile
+            || workspace.monocle_container.is_some()
+            || workspace.maximized_window.is_some()
+        {
+            return None;
+        }
+
+        workspace.container_idx_for_window(hwnd).map(|c| (m, c))
+    })?;
+
+    wm.focus_monitor(monitor_idx).ok()?;
+    let workspace = wm.focused_workspace_mut().ok()?;
+    workspace.focus_container(container_idx);
+    workspace.layer = WorkspaceLayer::Tiling;
+
+    // Only the default layouts support resizing; leave custom layouts unconstrained
+    if !matches!(workspace.layout, Layout::Default(_)) {
+        return Some(ResizableEdges {
+            left: true,
+            right: true,
+            up: true,
+            down: true,
+        });
+    }
+
+    let len = NonZeroUsize::new(workspace.containers().len())?;
+    let can = |direction: OperationDirection| {
+        direction
+            .destination(
+                workspace.layout.as_boxed_direction().as_ref(),
+                workspace.layout_flip,
+                container_idx,
+                len,
+                workspace.layout_options,
+            )
+            .is_some()
+    };
+
+    Some(ResizableEdges {
+        left: can(OperationDirection::Left),
+        right: can(OperationDirection::Right),
+        up: can(OperationDirection::Up),
+        down: can(OperationDirection::Down),
+    })
+}
+
+/// Run an event through the window manager synchronously, falling back to the
+/// event channel if the window manager handle has not been registered
+fn process(event: WindowManagerEvent) {
+    match WM.get() {
+        Some(wm) => {
+            if let Err(error) = wm.lock().process_event(event) {
+                tracing::warn!("mouse drag event failed: {error}");
+            }
+        }
+        None => {
+            if let Err(error) = winevent_listener::event_tx().send(event) {
+                tracing::error!("mouse drag could not send event: {error}");
+            }
+        }
+    }
 }
 
 fn tap_dummy_key() {
@@ -414,85 +583,115 @@ fn tap_dummy_key() {
     unsafe { SendInput(&inputs, size_of::<INPUT>() as i32) };
 }
 
-fn send_event(event: WindowManagerEvent) {
-    if let Err(error) = winevent_listener::event_tx().send(event) {
-        tracing::error!("mouse drag could not send event: {error}");
+fn begin(hwnd: isize, op: DragOp, x: i32, y: i32) -> Option<Drag> {
+    if MODIFIER.load(Ordering::Relaxed) == MouseDragModifier::Win as u8 {
+        tap_dummy_key();
+    }
+
+    let mut rect = RECT::default();
+    unsafe { GetWindowRect(HWND(hwnd as *mut core::ffi::c_void), &mut rect) }.ok()?;
+
+    let edges = WM.get().and_then(|wm| prepare_tiled(&mut wm.lock(), hwnd));
+    let tiled = edges.is_some();
+
+    let near_left = x < (rect.left + rect.right) / 2;
+    let near_top = y < (rect.top + rect.bottom) / 2;
+
+    let (edge_x, edge_y) = match edges {
+        Some(e) => (
+            pick_edge(near_left, e.left, e.right),
+            pick_edge(near_top, e.up, e.down),
+        ),
+        // Floating windows: resize from the nearest corner, like Hyprland
+        None => (
+            if near_left { -1 } else { 1 },
+            if near_top { -1 } else { 1 },
+        ),
+    };
+
+    let window = Window::from(hwnd);
+    if let Err(error) = window.focus(false) {
+        tracing::warn!("mouse drag could not focus window: {error}");
+    }
+
+    // Animating every live resize step would make the layout lag behind the cursor
+    let restore_animation = (op == DragOp::Resize && tiled)
+        .then(|| ANIMATION_ENABLED_GLOBAL.swap(false, Ordering::SeqCst));
+
+    process(WindowManagerEvent::MoveResizeStart(
+        WinEvent::SystemMoveSizeStart,
+        window,
+    ));
+
+    tracing::info!(
+        "mouse drag {op:?} started for hwnd {hwnd} (tiled: {tiled}, edges: {edge_x},{edge_y})"
+    );
+
+    Some(Drag {
+        hwnd,
+        op,
+        origin: POINT { x, y },
+        rect,
+        edge_x,
+        edge_y,
+        tiled,
+        last_live_update: Instant::now(),
+        restore_animation,
+    })
+}
+
+fn end(drag: Drag, x: i32, y: i32) {
+    drag.apply(x, y, false);
+    process(WindowManagerEvent::MoveResizeEnd(
+        WinEvent::SystemMoveSizeEnd,
+        Window::from(drag.hwnd),
+    ));
+
+    if let Some(enabled) = drag.restore_animation {
+        ANIMATION_ENABLED_GLOBAL.store(enabled, Ordering::SeqCst);
     }
 }
 
 fn worker() {
     let rx = channel().1.clone();
     let mut drag: Option<Drag> = None;
+    // A message pulled off the queue while coalescing motion, handled next
+    let mut pending: Option<DragMessage> = None;
 
-    while let Ok(mut message) = rx.recv() {
-        // Coalesce queued motion so the window tracks the latest cursor position
-        if matches!(message, DragMessage::Motion { .. }) {
-            while let Ok(next) = rx.try_recv() {
-                if matches!(next, DragMessage::Motion { .. }) {
-                    message = next;
-                } else {
-                    if let DragMessage::Motion { x, y } = message
-                        && let Some(d) = &drag
-                    {
-                        d.apply(x, y, true);
-                    }
-                    message = next;
-                    break;
-                }
-            }
-        }
+    loop {
+        let message = match pending.take() {
+            Some(message) => message,
+            None => match rx.recv() {
+                Ok(message) => message,
+                Err(_) => break,
+            },
+        };
 
         match message {
             DragMessage::Begin { hwnd, op, x, y } => {
-                if MODIFIER.load(Ordering::Relaxed) == MouseDragModifier::Win as u8 {
-                    tap_dummy_key();
+                if let Some(previous) = drag.take() {
+                    end(previous, x, y);
                 }
-
-                let mut rect = RECT::default();
-                if unsafe { GetWindowRect(HWND(hwnd as *mut core::ffi::c_void), &mut rect) }
-                    .is_err()
-                {
-                    drag = None;
-                    continue;
-                }
-
-                // Resize from the corner nearest to the cursor, like Hyprland
-                let edge_x = if x < (rect.left + rect.right) / 2 { -1 } else { 1 };
-                let edge_y = if y < (rect.top + rect.bottom) / 2 { -1 } else { 1 };
-
-                let window = Window::from(hwnd);
-                if let Err(error) = window.focus(false) {
-                    tracing::warn!("mouse drag could not focus window: {error}");
-                }
-
-                send_event(WindowManagerEvent::MoveResizeStart(
-                    WinEvent::SystemMoveSizeStart,
-                    window,
-                ));
-
-                tracing::info!("mouse drag {op:?} started for hwnd {hwnd}");
-
-                drag = Some(Drag {
-                    hwnd,
-                    op,
-                    origin: POINT { x, y },
-                    rect,
-                    edge_x,
-                    edge_y,
-                });
+                drag = begin(hwnd, op, x, y);
             }
-            DragMessage::Motion { x, y } => {
-                if let Some(d) = &drag {
-                    d.apply(x, y, true);
+            DragMessage::Motion { mut x, mut y } => {
+                // Coalesce queued motion so the window tracks the latest position
+                while let Ok(next) = rx.try_recv() {
+                    if let DragMessage::Motion { x: nx, y: ny } = next {
+                        (x, y) = (nx, ny);
+                    } else {
+                        pending = Some(next);
+                        break;
+                    }
+                }
+
+                if let Some(d) = drag.as_mut() {
+                    d.live_resize(x, y);
                 }
             }
             DragMessage::End { x, y } => {
                 if let Some(d) = drag.take() {
-                    d.apply(x, y, false);
-                    send_event(WindowManagerEvent::MoveResizeEnd(
-                        WinEvent::SystemMoveSizeEnd,
-                        Window::from(d.hwnd),
-                    ));
+                    end(d, x, y);
                 }
             }
         }

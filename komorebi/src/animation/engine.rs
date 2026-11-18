@@ -43,7 +43,10 @@ impl AnimationEngine {
                 ANIMATION_MANAGER.lock().end(animation_key);
             }
 
-            std::thread::sleep(Duration::from_millis(250 / 2));
+            // Poll quickly: the running animation notices the cancel on its next
+            // frame (~16ms). Sleeping 125ms here delayed every re-layout that
+            // interrupted an in-flight animation (e.g. open/close bursts).
+            std::thread::sleep(Duration::from_millis(2));
         }
 
         let latest_cancel_idx = ANIMATION_MANAGER.lock().latest_cancel_idx(animation_key);
