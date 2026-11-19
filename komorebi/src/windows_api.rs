@@ -575,6 +575,36 @@ impl WindowsApi {
 
     /// Raise the window to the top of the Z order, but do not activate or focus
     /// it. Use raise_and_focus_window to activate and focus a window.
+    /// The one of `hwnds` that is lowest in the Z order of top-level windows
+    pub fn lowest_in_z_order(hwnds: &[isize]) -> Option<isize> {
+        let mut lowest = None;
+        let mut current = Self::top_window().ok();
+        // bounded, in case the chain changes under us
+        for _ in 0..4096 {
+            let Some(hwnd) = current else { break };
+            if hwnds.contains(&hwnd) {
+                lowest = Some(hwnd);
+            }
+            current = Self::next_window(hwnd).ok().filter(|next| *next != 0);
+        }
+        lowest
+    }
+
+    /// Put `hwnd` directly below `above` in the Z order, without activating it. Unlike
+    /// raising a window over the foreground one, which Windows ignores when it is not asked
+    /// by the foreground process, this is allowed.
+    pub fn place_below(hwnd: isize, above: isize) -> eyre::Result<()> {
+        let flags =
+            SetWindowPosition::NO_MOVE | SetWindowPosition::NO_SIZE | SetWindowPosition::NO_ACTIVATE;
+
+        Self::set_window_pos(
+            HWND(as_ptr!(hwnd)),
+            &Rect::default(),
+            HWND(as_ptr!(above)),
+            flags.bits(),
+        )
+    }
+
     pub fn raise_window(hwnd: isize) -> eyre::Result<()> {
         let mut flags = SetWindowPosition::NO_MOVE
             | SetWindowPosition::NO_SIZE

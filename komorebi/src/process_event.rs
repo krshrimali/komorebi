@@ -46,6 +46,29 @@ fn should_skip_focus_change(foreground_hwnd: Option<isize>, window_hwnd: isize) 
 /// to nothing until the user refocuses by hand. Refocus only in that case, otherwise
 /// foreground successor is left to FocusChange so we don't fight the OS or desync
 /// focus.
+/// Tuck the focused tile (and its border) in directly below the lowest of the workspace's
+/// floating windows, so that they stay in front of it. Raising the floating windows over
+/// the foreground window instead is ignored by Windows, as komorebi is not the foreground
+/// process.
+fn keep_floating_windows_above(tile: isize, floating: &[isize]) {
+    let Some(lowest) = WindowsApi::lowest_in_z_order(floating) else {
+        return;
+    };
+
+    let mut above = lowest;
+    if let Some(border) = crate::border_manager::window_border(tile) {
+        if let Err(error) = WindowsApi::place_below(border.border_hwnd, above) {
+            tracing::debug!("could not place the border of {tile} below the floating windows: {error}");
+        } else {
+            above = border.border_hwnd;
+        }
+    }
+
+    if let Err(error) = WindowsApi::place_below(tile, above) {
+        tracing::debug!("could not place {tile} below the floating windows: {error}");
+    }
+}
+
 fn should_refocus_after_destroy(foreground_hwnd: Option<isize>) -> bool {
     matches!(foreground_hwnd, None | Some(0))
 }
@@ -480,6 +503,24 @@ impl WindowManager {
                         }
 
                         workspace.layer = WorkspaceLayer::Tiling;
+
+                        // Like Hyprland, floating windows stay above the tiled ones: focusing
+                        // a tile raised it over them, and they could only be got back with
+                        // alt-tab. Windows that cover the whole monitor (fullscreen games)
+                        // are left where they are, so that the user can get past them.
+                        let floating: Vec<isize> = workspace
+                            .floating_windows()
+                            .iter()
+                            .filter(|w| {
+                                !w.is_miminized()
+                                    && WindowsApi::is_window_visible(w.hwnd)
+                                    && !WindowsApi::covers_monitor(w.hwnd)
+                            })
+                            .map(|w| w.hwnd)
+                            .collect();
+                        if !floating.is_empty() {
+                            keep_floating_windows_above(window.hwnd, &floating);
+                        }
 
                         if matches!(
                             self.focused_workspace()?.layout,
