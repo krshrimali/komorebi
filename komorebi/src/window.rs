@@ -410,6 +410,17 @@ impl Window {
                 live_resize::follow(self.hwnd, &window_rect, layout);
             }
 
+            // it may only be here because an animation that is taking it
+            // somewhere else has not moved it yet (e.g. moved to another monitor
+            // and straight back): that animation is not to land after this
+            let key = new_animation_key(GhostDispatcher::PREFIX, self.hwnd.to_string());
+            if AnimationEngine::is_animating(&key) {
+                AnimationEngine::cancel(&key);
+                if WindowsApi::window_rect(self.hwnd)? != *layout {
+                    return WindowsApi::position_window(self.hwnd, layout, top, true);
+                }
+            }
+
             return Ok(());
         }
 
@@ -448,9 +459,7 @@ impl Window {
         // way somewhere is stopped where it is, first
         if live_resize::is_in_place() {
             let key = new_animation_key(GhostDispatcher::PREFIX, self.hwnd.to_string());
-            if ANIMATION_MANAGER.lock().in_progress(&key) {
-                AnimationEngine::cancel(&key);
-            }
+            AnimationEngine::cancel(&key);
 
             return WindowsApi::position_window(self.hwnd, layout, top, true);
         }

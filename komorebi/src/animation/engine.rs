@@ -37,26 +37,19 @@ impl AnimationEngine {
         }
     }
 
-    /// Returns true if the animation needs to continue
-    pub fn cancel(animation_key: &str) -> bool {
-        // should be more than 0
-        let cancel_idx = ANIMATION_MANAGER.lock().init_cancel(animation_key);
-        let max_duration = Duration::from_secs(5);
-        let spent_duration = Instant::now();
+    /// Whether an animation of `animation_key` is asked for, being prepared or drawn
+    pub fn is_animating(animation_key: &str) -> bool {
+        generations::active(animation_key)
+    }
 
-        while ANIMATION_MANAGER.lock().in_progress(animation_key) {
-            if spent_duration.elapsed() >= max_duration {
-                ANIMATION_MANAGER.lock().end(animation_key);
-            }
-
-            std::thread::sleep(Duration::from_millis(CANCEL_POLL_INTERVAL_MS));
+    /// Stop whatever animation `animation_key` has in flight or being
+    /// prepared, and wait (briefly) for it to let go of its window, so that the
+    /// caller can put the window somewhere itself.
+    pub fn cancel(animation_key: &str) {
+        let generation = generations::register(animation_key);
+        if generations::claim(animation_key, generation, Duration::from_millis(500)) {
+            generations::release(animation_key, generation);
         }
-
-        let latest_cancel_idx = ANIMATION_MANAGER.lock().latest_cancel_idx(animation_key);
-
-        ANIMATION_MANAGER.lock().end_cancel(animation_key);
-
-        latest_cancel_idx == cancel_idx
     }
 
     /// Animate with `render_dispatcher` for `duration`.
@@ -68,9 +61,16 @@ impl AnimationEngine {
         render_dispatcher: impl RenderDispatcher + Send + 'static,
         duration: Duration,
     ) -> eyre::Result<()> {
+        // Generations are handed out here, on the thread that decides where
+        // windows go, so that they are in the order the decisions were made;
+        // the animations themselves are prepared on other threads, in any order
+        let key = render_dispatcher.get_animation_key();
+        let generation = generations::register(&key);
         let animation = Animation {
             dispatcher: Box::new(render_dispatcher),
             duration,
+            key,
+            generation,
         };
 
         let batched = BATCH.with(|batch| match batch.borrow_mut().as_mut() {
@@ -106,17 +106,29 @@ impl AnimationEngine {
                     .into_iter()
                     .map(|animation| {
                         scope.spawn(move || {
-                            let key = animation.dispatcher.get_animation_key();
-                            if ANIMATION_MANAGER.lock().in_progress(key.as_str()) {
-                                let should_animate = Self::cancel(key.as_str());
+                            let key = animation.key.clone();
+                            let generation = animation.generation;
 
-                                if !should_animate {
-                                    return None;
-                                }
+                            // One animation of a window at a time, and only the
+                            // latest: an older one that is still being prepared
+                            // or drawn gives way at its next check
+                            if !generations::claim(&key, generation, CLAIM_TIMEOUT) {
+                                tracing::debug!("animation {key} was superseded before it started");
+                                return None;
                             }
 
                             if let Err(error) = animation.dispatcher.pre_render() {
                                 tracing::warn!("animation {key} could not be prepared: {error}");
+                                generations::release(&key, generation);
+                                return None;
+                            }
+
+                            if generations::superseded(&key, generation) {
+                                tracing::debug!(
+                                    "animation {key} was superseded while it was prepared"
+                                );
+                                animation.dispatcher.cleanup_on_cancel();
+                                generations::release(&key, generation);
                                 return None;
                             }
 
@@ -144,9 +156,10 @@ impl AnimationEngine {
             while !pending.is_empty() {
                 // check if any animation is cancelled
                 pending.retain(|(key, animation)| {
-                    if ANIMATION_MANAGER.lock().is_cancelled(key.as_str()) {
-                        ANIMATION_MANAGER.lock().cancel(key.as_str());
+                    if generations::superseded(key, animation.generation) {
+                        ANIMATION_MANAGER.lock().end(key.as_str());
                         animation.dispatcher.cleanup_on_cancel();
+                        generations::release(key, animation.generation);
                         false
                     } else {
                         true
@@ -215,15 +228,23 @@ impl AnimationEngine {
             let landed_tx = landed_tx.clone();
 
             std::thread::spawn(move || {
-                tracing::trace!("landing {key}: drawing the last frame");
-                // limit progress to 1.0 if animation took longer, and process
-                // the animation for 1.0 to set the target position
-                animation.dispatcher.render(1.0).ok();
+                if generations::superseded(&key, animation.generation) {
+                    // a newer animation of this window is waiting for this one
+                    // to let go; landing now would put the window where it was
+                    // going before
+                    animation.dispatcher.cleanup_on_cancel();
+                } else {
+                    tracing::trace!("landing {key}: drawing the last frame");
+                    // limit progress to 1.0 if animation took longer, and process
+                    // the animation for 1.0 to set the target position
+                    animation.dispatcher.render(1.0).ok();
 
-                tracing::trace!("landing {key}: finishing");
-                if let Err(error) = animation.dispatcher.post_render() {
-                    tracing::warn!("animation {key} could not be completed: {error}");
+                    tracing::trace!("landing {key}: finishing");
+                    if let Err(error) = animation.dispatcher.post_render() {
+                        tracing::warn!("animation {key} could not be completed: {error}");
+                    }
                 }
+                generations::release(&key, animation.generation);
 
                 tracing::trace!("landing {key}: landed");
                 let _ = landed_tx.send(key);
@@ -318,6 +339,86 @@ impl std::fmt::Display for FrameStats {
 struct Animation {
     dispatcher: Box<dyn RenderDispatcher + Send>,
     duration: Duration,
+    key: String,
+    /// Which decision about the window this animation carries out
+    generation: u64,
+}
+
+/// How long an animation waits for an older one of the same window to let go
+/// before it takes the window anyway
+const CLAIM_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Orders the animations of a window: each is given a generation when it is
+/// asked for, and only the latest generation may be prepared, drawn or landed.
+/// One that is overtaken gives way (cleaning up after itself) and the next
+/// waits for that before it starts, so two animations never fight over a
+/// window and the last decision about where it goes is the one that sticks.
+mod generations {
+    use parking_lot::Mutex;
+    use std::collections::HashMap;
+    use std::sync::LazyLock;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+    use std::time::Instant;
+
+    #[derive(Default)]
+    struct Slot {
+        latest: u64,
+        owner: Option<u64>,
+    }
+
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    static SLOTS: LazyLock<Mutex<HashMap<String, Slot>>> = LazyLock::new(Default::default);
+
+    pub fn register(key: &str) -> u64 {
+        let generation = NEXT.fetch_add(1, Ordering::SeqCst);
+        SLOTS.lock().entry(key.to_string()).or_default().latest = generation;
+        generation
+    }
+
+    pub fn active(key: &str) -> bool {
+        SLOTS.lock().contains_key(key)
+    }
+
+    pub fn superseded(key: &str, generation: u64) -> bool {
+        SLOTS
+            .lock()
+            .get(key)
+            .is_some_and(|slot| slot.latest != generation)
+    }
+
+    /// Wait until no other animation holds the window, then hold it. False
+    /// when a newer generation came along in the meantime.
+    pub fn claim(key: &str, generation: u64, timeout: Duration) -> bool {
+        let start = Instant::now();
+        loop {
+            {
+                let mut slots = SLOTS.lock();
+                let slot = slots.entry(key.to_string()).or_default();
+                if slot.latest != generation {
+                    return false;
+                }
+                if slot.owner.is_none() || start.elapsed() >= timeout {
+                    slot.owner = Some(generation);
+                    return true;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(super::CANCEL_POLL_INTERVAL_MS));
+        }
+    }
+
+    pub fn release(key: &str, generation: u64) {
+        let mut slots = SLOTS.lock();
+        if let Some(slot) = slots.get_mut(key) {
+            if slot.owner == Some(generation) {
+                slot.owner = None;
+            }
+            if slot.owner.is_none() && slot.latest == generation {
+                slots.remove(key);
+            }
+        }
+    }
 }
 
 thread_local! {
@@ -551,5 +652,60 @@ mod tests {
         let posted = events.iter().position(|e| e == "post replaced").unwrap();
         assert!(cancelled < posted);
         assert_eq!(events.iter().filter(|e| *e == "pre replaced").count(), 2);
+    }
+
+    /// Prepares slowly, as a ghost does while it takes its picture
+    struct SlowToPrepare(Recorder, Duration);
+
+    impl RenderDispatcher for SlowToPrepare {
+        fn get_animation_key(&self) -> String {
+            self.0.get_animation_key()
+        }
+
+        fn pre_render(&self) -> eyre::Result<()> {
+            std::thread::sleep(self.1);
+            self.0.pre_render()
+        }
+
+        fn render(&self, progress: f64) -> eyre::Result<()> {
+            self.0.render(progress)
+        }
+
+        fn post_render(&self) -> eyre::Result<()> {
+            self.0.post_render()
+        }
+
+        fn cleanup_on_cancel(&self) {
+            self.0.cleanup_on_cancel();
+        }
+    }
+
+    #[test]
+    fn a_newer_animation_wins_over_one_still_being_prepared() {
+        // the second decision about a window comes while the first animation
+        // is still taking its picture: the window must end up where the second
+        // one puts it, not be put back by the first one landing after it
+        let events = Arc::new(Mutex::new(Vec::new()));
+
+        AnimationEngine::animate(
+            SlowToPrepare(recorder("raced", &events), Duration::from_millis(150)),
+            Duration::from_millis(20),
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        AnimationEngine::animate(recorder("raced", &events), Duration::from_millis(20)).unwrap();
+
+        wait_for(&events, "post raced");
+        std::thread::sleep(Duration::from_millis(300));
+
+        let events = events.lock();
+        assert_eq!(
+            events.iter().filter(|e| *e == "post raced").count(),
+            1,
+            "only the latest animation lands: {events:?}"
+        );
+        let cancelled = events.iter().position(|e| e == "cancel raced");
+        let posted = events.iter().position(|e| e == "post raced").unwrap();
+        assert!(cancelled.is_some_and(|c| c < posted), "{events:?}");
     }
 }
