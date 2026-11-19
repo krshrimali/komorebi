@@ -1075,7 +1075,7 @@ fn window_is_eligible(
     };
 
     let floating_identifiers = FLOATING_APPLICATIONS.lock();
-    if let Some(rule) = should_act(
+    let floating_override = if let Some(rule) = should_act(
         title,
         exe_name,
         class,
@@ -1084,9 +1084,17 @@ fn window_is_eligible(
         &regex_identifiers,
     ) {
         debug.matches_floating_applications = Some(rule);
-    }
+        true
+    } else {
+        false
+    };
 
-    if should_ignore && !managed_override {
+    // A floating rule names the window more specifically than the broad ignore rules
+    // (e.g. every standard dialog, class #32770, is ignored by the bundled rules), so
+    // such a window is managed as floating: it belongs to a workspace, is hidden when
+    // that workspace is switched away from, and stays above the tiled windows. It
+    // still has to pass the style checks below.
+    if should_ignore && !managed_override && !floating_override {
         return false;
     }
 

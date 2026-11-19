@@ -246,6 +246,49 @@ impl WindowManager {
                 temp_dir().join("komorebi.state.json").to_string_lossy()
             );
 
+            // Windows found by init that the state file does not know about (opened while
+            // komorebi was not running, or dropped from an earlier state) would be thrown
+            // away by replacing the workspaces below and never managed again: not hidden
+            // on workspace switches, and for floating windows not kept on top. They are
+            // added to the workspace that is shown on their monitor instead.
+            let mut known = HashSet::new();
+            for monitor in state.monitors.elements() {
+                for workspace in monitor.workspaces() {
+                    known.extend(
+                        workspace
+                            .containers()
+                            .iter()
+                            .flat_map(|c| c.windows().iter().map(|w| w.hwnd)),
+                    );
+                    known.extend(
+                        workspace
+                            .monocle_container
+                            .iter()
+                            .flat_map(|c| c.windows().iter().map(|w| w.hwnd)),
+                    );
+                    known.extend(workspace.maximized_window.iter().map(|w| w.hwnd));
+                    known.extend(workspace.floating_windows().iter().map(|w| w.hwnd));
+                }
+            }
+
+            let mut unknown: Vec<Vec<Window>> = vec![];
+            for monitor in self.monitors() {
+                let mut windows = vec![];
+                for workspace in monitor.workspaces() {
+                    for window in workspace
+                        .containers()
+                        .iter()
+                        .flat_map(|c| c.windows().iter())
+                        .chain(workspace.floating_windows().iter())
+                    {
+                        if known.insert(window.hwnd) {
+                            windows.push(*window);
+                        }
+                    }
+                }
+                unknown.push(windows);
+            }
+
             let offset = self.work_area_offset;
             let mouse_follows_focus = self.mouse_follows_focus;
             for (monitor_idx, monitor) in self.monitors_mut().iter_mut().enumerate() {
@@ -284,6 +327,25 @@ impl WindowManager {
                         temp_dir().join("komorebi.state.json").to_string_lossy(),
                         error,
                     );
+                }
+
+                if let Some(windows) = unknown.get(monitor_idx)
+                    && let Some(workspace) = monitor.focused_workspace_mut()
+                {
+                    for window in windows {
+                        if !window.is_window() {
+                            continue;
+                        }
+
+                        tracing::info!("managing {} which is not in the state file", window.hwnd);
+                        if window.should_float() {
+                            workspace.floating_windows_mut().push_back(*window);
+                        } else {
+                            let mut container = Container::default();
+                            container.windows_mut().push_back(*window);
+                            workspace.add_container_to_back(container);
+                        }
+                    }
                 }
 
                 if let Err(error) = monitor.load_focused_workspace(mouse_follows_focus) {
