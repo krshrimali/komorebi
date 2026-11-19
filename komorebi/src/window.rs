@@ -357,8 +357,17 @@ impl Window {
             let (aspect_ratio_width, aspect_ratio_height) = FLOATING_WINDOW_TOGGLE_ASPECT_RATIO
                 .lock()
                 .width_and_height();
-            let target_height = work_area.bottom / 2;
-            let target_width = (target_height * aspect_ratio_width) / aspect_ratio_height;
+            let mut target_height = work_area.bottom / 2;
+            let mut target_width = (target_height * aspect_ratio_width) / aspect_ratio_height;
+
+            // half the height of a portrait monitor at a landscape aspect ratio is wider
+            // than the monitor: fit the width instead, keeping the aspect ratio
+            let max_width = work_area.right * 4 / 5;
+            if target_width > max_width {
+                target_width = max_width;
+                target_height = (target_width * aspect_ratio_height) / aspect_ratio_width;
+            }
+
             (target_width, target_height)
         } else {
             let current_rect = WindowsApi::window_rect(self.hwnd)?;
