@@ -288,7 +288,11 @@ impl App {
             };
             let g = &mut self.glow[i];
             let next = *g + (target - *g) * (1.0 - (-dt * 18.0).exp());
-            *g = if (next - target).abs() < 0.002 { target } else { next };
+            *g = if (next - target).abs() < 0.002 {
+                target
+            } else {
+                next
+            };
             glowing |= *g != target;
         }
 
@@ -350,8 +354,11 @@ impl App {
 
         let t0 = Instant::now();
         let mark = |what: &str| {
-            if std::env::var_os("KOMOREBI_OVERVIEW_DEBUG").is_some() {
-                log(&format!("{:>6.1}ms {what}", t0.elapsed().as_secs_f64() * 1000.0));
+            if debugging() {
+                log(&format!(
+                    "{:>6.1}ms {what}",
+                    t0.elapsed().as_secs_f64() * 1000.0
+                ));
             }
         };
 
@@ -381,7 +388,9 @@ impl App {
 
         let wallpaper_path = gfx::wallpaper_path();
         if wallpaper_path != self.wallpaper_path {
-            self.wallpaper = wallpaper_path.as_deref().and_then(|p| self.gfx.image_file(p));
+            self.wallpaper = wallpaper_path
+                .as_deref()
+                .and_then(|p| self.gfx.image_file(p));
             self.wallpaper_path = wallpaper_path;
         }
 
@@ -423,8 +432,7 @@ impl App {
             self.phase = Phase::Opening(Instant::now());
             self.render(Instant::now());
             cloak(self.hwnd, false);
-            let _ = SetForegroundWindow(self.hwnd);
-            let _ = SetFocus(Some(self.hwnd));
+            take_foreground(self.hwnd);
         }
         self.phase = Phase::Opening(Instant::now());
         self.last_frame = Instant::now();
@@ -433,6 +441,9 @@ impl App {
     }
 
     fn hide(&mut self) {
+        if debugging() {
+            log("hide");
+        }
         unsafe {
             let _ = ShowWindow(self.hwnd, SW_HIDE);
         }
@@ -524,7 +535,12 @@ impl App {
                     r: rect.r + 3.0 + inset,
                     b: rect.b + 3.0 + inset,
                 };
-                gfx.stroke(r, radius + 3.0, 2.5, rgba(0xffffff, 0.85 * glow * opacity * o));
+                gfx.stroke(
+                    r,
+                    radius + 3.0,
+                    2.5,
+                    rgba(0xffffff, 0.85 * glow * opacity * o),
+                );
             }
             self.draw_label(&workspace.name, rect, focused, opacity * o, glow);
         }
@@ -587,7 +603,13 @@ impl App {
                     gfx.fill(dest, 6.0, rgba(0x232a3a, 0.95 * opacity));
                     gfx.stroke(dest, 6.0, 1.0, rgba(0xffffff, 0.12 * opacity));
                     let size = (dest.h() * 0.09).clamp(9.0, 22.0);
-                    gfx.text(&shot.title, dest, size, false, rgba(0xffffff, 0.75 * opacity));
+                    gfx.text(
+                        &shot.title,
+                        dest,
+                        size,
+                        false,
+                        rgba(0xffffff, 0.75 * opacity),
+                    );
                 }
             }
         }
@@ -639,6 +661,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_TOGGLE => {
+            if debugging() {
+                log("toggle");
+            }
             with_app(App::toggle);
             LRESULT(0)
         }
@@ -652,6 +677,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if msg == WM_SYSKEYDOWN && vk == VK_F4.0 {
                 return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
             }
+            if debugging() {
+                log(&format!("key {vk:#x}"));
+            }
             with_app(|a| a.key(vk));
             LRESULT(0)
         }
@@ -660,7 +688,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_SYSKEYUP | WM_SYSCHAR => LRESULT(0),
         WM_ACTIVATE => {
             if (wparam.0 & 0xffff) as u32 == WA_INACTIVE {
-                if std::env::var_os("KOMOREBI_OVERVIEW_DEBUG").is_some() {
+                if debugging() {
                     let other = lparam.0;
                     let fg = unsafe { GetForegroundWindow() }.0 as isize;
                     log(&format!(
@@ -745,6 +773,50 @@ fn spawn_captures(monitor: &Monitor, hwnd: HWND, tx: mpsc::Sender<WindowShot>) {
     }
 }
 
+/// Make `hwnd` the foreground window with keyboard focus. Windows refuses this to a
+/// process that did not receive the last input (the hotkey went to whkd), so when the
+/// plain request does not stick, the input queue of the current foreground window is
+/// borrowed for the switch.
+fn take_foreground(hwnd: HWND) {
+    unsafe {
+        let _ = SetForegroundWindow(hwnd);
+        if GetForegroundWindow() == hwnd {
+            let _ = SetFocus(Some(hwnd));
+            return;
+        }
+
+        let foreground = GetForegroundWindow();
+        let theirs = GetWindowThreadProcessId(foreground, None);
+        let ours = windows::Win32::System::Threading::GetCurrentThreadId();
+        let attached = theirs != 0
+            && theirs != ours
+            && windows::Win32::System::Threading::AttachThreadInput(ours, theirs, true).as_bool();
+        let _ = BringWindowToTop(hwnd);
+        let _ = SetForegroundWindow(hwnd);
+        let _ = SetFocus(Some(hwnd));
+        if attached {
+            let _ = windows::Win32::System::Threading::AttachThreadInput(ours, theirs, false);
+        }
+
+        if debugging() {
+            log(&format!(
+                "foreground was refused; after borrowing the input of thread {theirs}: ours = {}",
+                GetForegroundWindow() == hwnd
+            ));
+        }
+    }
+}
+
+/// Diagnostics are written when KOMOREBI_OVERVIEW_DEBUG is set or
+/// %TEMP%\komorebi-overview.debug exists (the resident instance does not see
+/// the environment of the hotkey that toggles it)
+fn debugging() -> bool {
+    std::env::var_os("KOMOREBI_OVERVIEW_DEBUG").is_some()
+        || std::env::temp_dir()
+            .join("komorebi-overview.debug")
+            .exists()
+}
+
 /// Errors go to %TEMP%\komorebi-overview.log (there is no console)
 fn log(message: &str) {
     use std::io::Write;
@@ -773,6 +845,13 @@ fn run() -> Result<(), String> {
             && !existing.is_invalid()
         {
             if std::env::args().all(|a| a != "--daemon") {
+                // This instance was started by the hotkey and may take the foreground;
+                // pass that on, so that the overview gets the keyboard when it opens
+                let mut pid = 0;
+                GetWindowThreadProcessId(existing, Some(&mut pid));
+                if pid != 0 {
+                    let _ = AllowSetForegroundWindow(pid);
+                }
                 let _ = PostMessageW(Some(existing), WM_TOGGLE, WPARAM(0), LPARAM(0));
             }
             return Ok(());
