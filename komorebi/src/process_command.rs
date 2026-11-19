@@ -1241,14 +1241,17 @@ impl WindowManager {
                 if focused_pair != (monitor_idx, workspace_idx) {
                     self.focus_monitor(monitor_idx)?;
                     self.focus_workspace(workspace_idx)?;
+                    self.bring_cursor_to_empty_focused_workspace(focused_monitor_idx)?;
                 }
             }
             SocketMessage::FocusNamedWorkspace(ref name) => {
                 if let Some((monitor_idx, workspace_idx)) =
                     self.monitor_workspace_index_by_name(name)
                 {
+                    let previous_monitor_idx = self.focused_monitor_idx();
                     self.focus_monitor(monitor_idx)?;
                     self.focus_workspace(workspace_idx)?;
+                    self.bring_cursor_to_empty_focused_workspace(previous_monitor_idx)?;
                 }
             }
             SocketMessage::ToggleWorkspaceLayer => {

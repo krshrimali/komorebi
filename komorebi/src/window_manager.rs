@@ -3737,6 +3737,27 @@ impl WindowManager {
     }
 
     #[tracing::instrument(skip(self))]
+    /// After focus moved to another monitor's empty workspace there is no window for the
+    /// cursor to follow, so it would stay on the monitor that was left, and whatever is
+    /// opened next would go there. With mouse_follows_focus, bring it along.
+    pub fn bring_cursor_to_empty_focused_workspace(
+        &mut self,
+        previous_monitor_idx: usize,
+    ) -> eyre::Result<()> {
+        if !self.mouse_follows_focus || self.focused_monitor_idx() == previous_monitor_idx {
+            return Ok(());
+        }
+
+        if self.focused_workspace()?.is_empty()
+            && self.monitor_idx_from_current_pos() != Some(self.focused_monitor_idx())
+        {
+            let rect = self.focused_monitor_work_area()?;
+            WindowsApi::center_cursor_in_rect(&rect)?;
+        }
+
+        Ok(())
+    }
+
     pub fn focus_monitor(&mut self, idx: usize) -> eyre::Result<()> {
         tracing::info!("focusing monitor");
 
