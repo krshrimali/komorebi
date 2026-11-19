@@ -1,15 +1,12 @@
 use std::process::Command;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 use color_eyre::eyre;
 use color_eyre::eyre::OptionExt;
 use crossbeam_utils::atomic::AtomicConsume;
 use parking_lot::Mutex;
 
-use crate::core::OperationDirection;
 use crate::core::Rect;
-use crate::core::Sizing;
 use crate::core::WindowContainerBehaviour;
 
 use crate::CURRENT_VIRTUAL_DESKTOP;
@@ -24,8 +21,6 @@ use crate::TRAY_AND_MULTI_WINDOW_IDENTIFIERS;
 use crate::VirtualDesktopNotification;
 use crate::Window;
 use crate::border_manager;
-use crate::border_manager::BORDER_OFFSET;
-use crate::border_manager::BORDER_WIDTH;
 use crate::current_virtual_desktop;
 use crate::notify_subscribers;
 use crate::splash;
@@ -40,6 +35,60 @@ use crate::window_manager_event::WindowManagerEvent;
 use crate::windows_api::WindowsApi;
 use crate::winevent::WinEvent;
 use crate::workspace::WorkspaceLayer;
+
+fn should_skip_focus_change(foreground_hwnd: Option<isize>, window_hwnd: isize) -> bool {
+    matches!(foreground_hwnd, Some(hwnd) if hwnd != window_hwnd)
+}
+
+/// After a managed window is destroyed, Windows may promote no successor, leaving
+/// the foreground null with no FocusChange to reconcile from. The selection then
+/// never regains focus: every border renders unfocused and keystrokes fall through
+/// to nothing until the user refocuses by hand. Refocus only in that case, otherwise
+/// foreground successor is left to FocusChange so we don't fight the OS or desync
+/// focus.
+fn should_refocus_after_destroy(foreground_hwnd: Option<isize>) -> bool {
+    matches!(foreground_hwnd, None | Some(0))
+}
+
+#[cfg(test)]
+mod focus_change_tests {
+    use super::should_skip_focus_change;
+
+    #[test]
+    fn skips_focus_change_from_background_window() {
+        assert!(should_skip_focus_change(Some(1), 2));
+    }
+
+    #[test]
+    fn allows_focus_change_for_foreground_window() {
+        assert!(!should_skip_focus_change(Some(1), 1));
+    }
+
+    #[test]
+    fn allows_focus_change_when_foreground_unknown() {
+        assert!(!should_skip_focus_change(None, 1));
+    }
+}
+
+#[cfg(test)]
+mod destroy_focus_tests {
+    use super::should_refocus_after_destroy;
+
+    #[test]
+    fn refocuses_when_foreground_is_null() {
+        assert!(should_refocus_after_destroy(Some(0)));
+    }
+
+    #[test]
+    fn refocuses_when_foreground_is_unavailable() {
+        assert!(should_refocus_after_destroy(None));
+    }
+
+    #[test]
+    fn defers_when_a_successor_took_the_foreground() {
+        assert!(!should_refocus_after_destroy(Some(12345)));
+    }
+}
 
 #[tracing::instrument]
 pub fn listen_for_events(wm: Arc<Mutex<WindowManager>>) {
@@ -268,7 +317,22 @@ impl WindowManager {
                 self.has_pending_raise_op = false;
             }
             WindowManagerEvent::Destroy(_, window) | WindowManagerEvent::Unmanage(window) => {
-                if self.remove_window_anywhere(window.hwnd)? {
+                let removed = if self.focused_workspace()?.contains_window(window.hwnd) {
+                    self.focused_workspace_mut()?.remove_window(window.hwnd)?;
+
+                    // With refocus true, update_focused_workspace focuses the surviving
+                    // selection (maximized/monocle/tiling); with refocus false it only
+                    // re-tiles.
+                    let refocus =
+                        should_refocus_after_destroy(WindowsApi::foreground_window().ok());
+                    self.update_focused_workspace(refocus, refocus)?;
+                    true
+                } else {
+                    // e.g. a window closed while its workspace is hidden
+                    self.remove_window_anywhere(window.hwnd)?
+                };
+
+                if removed {
                     let mut already_moved_window_handles = self.already_moved_window_handles.lock();
 
                     already_moved_window_handles.remove(&window.hwnd);
@@ -341,7 +405,12 @@ impl WindowManager {
 
                 if hide {
                     self.focused_workspace_mut()?.remove_window(window.hwnd)?;
-                    self.update_focused_workspace(false, false)?;
+
+                    // Closing a window sends Hide and not Destroy to many applications, so
+                    // hand focus on to the surviving window as the Destroy arm does
+                    let refocus =
+                        should_refocus_after_destroy(WindowsApi::foreground_window().ok());
+                    self.update_focused_workspace(refocus, refocus)?;
                 }
 
                 let mut already_moved_window_handles = self.already_moved_window_handles.lock();
@@ -349,6 +418,13 @@ impl WindowManager {
                 already_moved_window_handles.remove(&window.hwnd);
             }
             WindowManagerEvent::FocusChange(_, window) => {
+                if should_skip_focus_change(WindowsApi::foreground_window().ok(), window.hwnd) {
+                    tracing::debug!(
+                        "ignoring stale focus change for hwnd {} as it is not the foreground window",
+                        window.hwnd
+                    );
+                    return Ok(());
+                }
                 // don't want to trigger the full workspace updates when there are no managed
                 // containers - this makes floating windows on empty workspaces go into very
                 // annoying focus change loops which prevents users from interacting with them
@@ -602,13 +678,22 @@ impl WindowManager {
 
                 WindowsApi::bring_window_to_top(window.hwnd)?;
 
+                let started_from = WindowsApi::window_rect(window.hwnd)?;
+
                 let pending_move_op = Arc::make_mut(&mut self.pending_move_op);
-                *pending_move_op = Option::from((monitor_idx, workspace_idx, window.hwnd));
+                *pending_move_op =
+                    Option::from((monitor_idx, workspace_idx, window.hwnd, started_from));
+
+                self.live_resize_begin(window.hwnd, started_from);
             }
             WindowManagerEvent::MoveResizeEnd(_, window) => {
                 // A mouse_drag move tells us it was a move: the size heuristic below
                 // misfires when a window can't fit its tile or changes DPI on drop
                 let op_hint = crate::mouse_drag::take_move_hint();
+
+                // the workspace is as it was when the user took hold, which is what the
+                // end of a drag is worked out from, with steps or without
+                let _snapping = self.live_resize_end();
 
                 // We need this because if the event ends on a different monitor,
                 // that monitor will already have been focused and updated in the state
@@ -619,7 +704,7 @@ impl WindowManager {
 
                 // If the window handles don't match then something went wrong and the pending move
                 // is not related to this current move, if so abort this operation.
-                if let Some((_, _, w_hwnd)) = pending
+                if let Some((_, _, w_hwnd, _)) = pending
                     && w_hwnd != window.hwnd
                 {
                     color_eyre::eyre::bail!(
@@ -641,15 +726,21 @@ impl WindowManager {
                 let workspace = self.focused_workspace_mut()?;
                 let focused_container_idx = workspace.focused_container_idx();
                 let new_position = WindowsApi::window_rect(window.hwnd)?;
-                let old_position = *workspace
-                    .latest_layout
-                    .get(focused_container_idx)
-                    // If the move was to another monitor with an empty workspace, the
-                    // workspace here will refer to that empty workspace, which won't
-                    // have any latest layout set. We fall back to a Default for Rect
-                    // which allows us to make a reasonable guess that the drag has taken
-                    // place across a monitor boundary to an empty workspace
-                    .unwrap_or(&Rect::default());
+                // Measure against the rect the window had when the drag started, which is what
+                // the user had under the pointer; a window is not always exactly on its tile
+                // (cell grids, minimum sizes, border insets)
+                let old_position = match pending {
+                    Some((_, _, _, started_from)) => started_from,
+                    None => *workspace
+                        .latest_layout
+                        .get(focused_container_idx)
+                        // If the move was to another monitor with an empty workspace, the
+                        // workspace here will refer to that empty workspace, which won't
+                        // have any latest layout set. We fall back to a Default for Rect
+                        // which allows us to make a reasonable guess that the drag has taken
+                        // place across a monitor boundary to an empty workspace
+                        .unwrap_or(&Rect::default()),
+                };
 
                 // This will be true if we have moved to another monitor
                 let mut moved_across_monitors = false;
@@ -660,7 +751,7 @@ impl WindowManager {
                     moved_across_monitors = true;
                 }
 
-                if let Some((origin_monitor_idx, origin_workspace_idx, _)) = pending {
+                if let Some((origin_monitor_idx, origin_workspace_idx, _, _)) = pending {
                     // If we didn't move to another monitor with an empty workspace, it is
                     // still possible that we moved to another monitor with a populated workspace
                     if !moved_across_monitors {
@@ -693,27 +784,18 @@ impl WindowManager {
                 if (workspace.tile && workspace.contains_managed_window(window.hwnd))
                     || moved_across_monitors
                 {
-                    let resize = Rect {
-                        left: new_position.left - old_position.left,
-                        top: new_position.top - old_position.top,
-                        right: new_position.right - old_position.right,
-                        bottom: new_position.bottom - old_position.bottom,
-                    };
-
                     // If we have moved across the monitors, use that override, otherwise determine
                     // if a move has taken place by ruling out a resize
-                    let right_bottom_constant = 0;
-
                     let is_move = op_hint
                         || moved_across_monitors
-                        || resize.right.abs() == right_bottom_constant
-                            && resize.bottom.abs() == right_bottom_constant;
+                        || (new_position.right == old_position.right
+                            && new_position.bottom == old_position.bottom);
 
                     if is_move {
                         tracing::info!("moving with mouse");
 
                         if moved_across_monitors {
-                            if let Some((origin_monitor_idx, origin_workspace_idx, w_hwnd)) =
+                            if let Some((origin_monitor_idx, origin_workspace_idx, w_hwnd, _)) =
                                 pending
                             {
                                 let target_workspace_idx = self
@@ -802,51 +884,68 @@ impl WindowManager {
                         }
                     } else {
                         tracing::info!("resizing with mouse");
-                        let mut ops = vec![];
-
-                        macro_rules! resize_op {
-                            ($coordinate:expr, $comparator:tt, $direction:expr) => {{
-                                let adjusted = $coordinate * 2;
-                                let sizing = if adjusted $comparator 0 {
-                                    Sizing::Decrease
-                                } else {
-                                    Sizing::Increase
-                                };
-
-                                ($direction, sizing, adjusted.abs())
-                            }};
+                        // Resize the container of the dragged window, which is not necessarily
+                        // the focused one if the press that began the drag did not focus it yet
+                        let workspace = self.focused_workspace_mut()?;
+                        let mut tile = None;
+                        if let Some(idx) = workspace.container_idx_for_window(window.hwnd) {
+                            workspace.focus_container(idx);
+                            tile = workspace.latest_layout.get(idx).copied();
                         }
 
-                        if resize.left != 0 {
-                            ops.push(resize_op!(resize.left, >, OperationDirection::Left));
-                        }
+                        // The window has moved some way by the time the start of the drag is
+                        // handled, so what was read then is not where the edge was taken from
+                        let old_position = crate::live_resize::drag_origin(
+                            &old_position,
+                            &new_position,
+                            tile.as_ref(),
+                        );
 
-                        if resize.top != 0 {
-                            ops.push(resize_op!(resize.top, >, OperationDirection::Up));
-                        }
-
-                        // TODO: Determine if this is still needed
-                        let top_left_constant = BORDER_WIDTH.load(Ordering::SeqCst)
-                            + BORDER_OFFSET.load(Ordering::SeqCst);
-
-                        if resize.right != 0
-                            && (resize.left == top_left_constant || resize.left == 0)
+                        for (edge, sizing, by) in
+                            crate::live_resize::edges_moved(&old_position, &new_position)
                         {
-                            ops.push(resize_op!(resize.right, <, OperationDirection::Right));
+                            self.resize_window(edge, sizing, by, false)?;
                         }
 
-                        if resize.bottom != 0
-                            && (resize.top == top_left_constant || resize.top == 0)
-                        {
-                            ops.push(resize_op!(resize.bottom, <, OperationDirection::Down));
+                        // Also puts back a window dragged by an edge with no neighbour
+                        if new_position != old_position {
+                            self.update_focused_workspace(false, false)?;
                         }
-
-                        for (edge, sizing, delta) in ops {
-                            self.resize_window(edge, sizing, delta, true)?;
-                        }
-
-                        self.update_focused_workspace(false, false)?;
                     }
+                }
+            }
+            WindowManagerEvent::Maximize(_, window) => {
+                // The user maximized a tiled window themselves, with its button or by
+                // double-clicking its title bar: it is the window that is maximized as if it had
+                // been by the command. It may have been restored again by the time this is read,
+                // and a maximize that the command made is already known.
+                let workspace = self.focused_workspace_mut()?;
+
+                if WindowsApi::is_zoomed(window.hwnd)
+                    && workspace.maximized_window.is_none()
+                    && workspace.monocle_container.is_none()
+                    && workspace.container_idx_for_window(window.hwnd).is_some()
+                {
+                    tracing::info!("window maximized by the user");
+                    workspace.focus_container_by_window(window.hwnd)?;
+                    workspace.layer = WorkspaceLayer::Tiling;
+                    workspace.new_maximized_window()?;
+                    self.update_focused_workspace(false, false)?;
+                }
+            }
+            WindowManagerEvent::Unmaximize(_, window) => {
+                // The user restored the window that is maximized, which puts it back in its
+                // tile as the command does. A restore that the command made is already known.
+                let workspace = self.focused_workspace_mut()?;
+
+                if !WindowsApi::is_zoomed(window.hwnd)
+                    && workspace
+                        .maximized_window
+                        .is_some_and(|maximized| maximized.hwnd == window.hwnd)
+                {
+                    tracing::info!("window restored by the user");
+                    workspace.reintegrate_maximized_window()?;
+                    self.update_focused_workspace(false, false)?;
                 }
             }
             WindowManagerEvent::MouseCapture(..)

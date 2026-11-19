@@ -234,14 +234,33 @@ pub struct LayoutOptions {
     pub row_ratios: Option<[Option<f32>; MAX_RATIOS]>,
 }
 
+/// A centring is one of its names, or a boolean, which is what it used to be
+#[cfg(feature = "schemars")]
+fn centering_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "description": "When to centre the focused column: `Never` (the default), `Always`, or
+`OnOverflow`, which is when it does not fit on the screen together with the column that
+focus came from. A boolean is also accepted, where `true` is `Always` and `false` is `Never`",
+        "anyOf": [
+            { "type": "boolean" },
+            generator.subschema_for::<crate::scrolling::ScrollingCentering>(),
+            { "type": "null" }
+        ]
+    })
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 /// Options for the Scrolling layout
 pub struct ScrollingLayoutOptions {
     /// Desired number of visible columns (default: 3)
     pub columns: usize,
-    /// With an odd number of visible columns, keep the focused window column centered
-    pub center_focused_column: Option<bool>,
+    /// When to centre the focused column: `Never` (the default), `Always`, or `OnOverflow`, which
+    /// is when it does not fit on the screen together with the column that focus came from. A
+    /// boolean is also accepted, where `true` is `Always` and `false` is `Never`
+    #[serde(default)]
+    #[cfg_attr(feature = "schemars", schemars(schema_with = "centering_schema"))]
+    pub center_focused_column: Option<crate::scrolling::ScrollingCentering>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -301,11 +320,31 @@ impl DefaultLayout {
         }
     }
 
+    /// Returns the container index of the primary (largest) pane for this layout.
+    ///
+    /// For all default layouts, the primary container is always at index 0.
     #[must_use]
-    #[allow(clippy::cast_precision_loss, clippy::only_used_in_recursion)]
+    pub fn primary_index(&self) -> usize {
+        0
+    }
+
+    /// Returns the container index of the secondary pane for this layout,
+    /// if there are enough containers. Returns `None` if there are fewer than 2 containers.
+    ///
+    /// For all default layouts, the secondary container is at index 1.
+    /// - **BSP**: the second-largest split area
+    /// - **UltrawideVerticalStack**: the left (secondary) column
+    /// - **VerticalStack / HorizontalStack / RightMainVerticalStack**: the first container in the stack area
+    /// - **Columns / Rows / Grid / Scrolling**: simply the second container
+    #[must_use]
+    pub fn secondary_index(&self, container_count: usize) -> Option<usize> {
+        if container_count >= 2 { Some(1) } else { None }
+    }
+
+    #[must_use]
     pub fn resize(
         &self,
-        unaltered: &Rect,
+        _unaltered: &Rect,
         resize: &Option<Rect>,
         edge: OperationDirection,
         sizing: Sizing,
@@ -327,42 +366,26 @@ impl DefaultLayout {
 
         let mut r = resize.unwrap_or_default();
 
-        // Adjustments are in resize units; the default layouts apply roughly half
-        // of an adjustment to the visible edge. Keep every tile at least
-        // MIN_TILE_SIZE pixels wide/tall, instead of the old limit of half the
-        // tile's unaltered size, which stopped mouse drags short.
-        //
-        // The old checks also tested a different value than the one they applied
-        // for Up (Increase tested `top + delta` but applied `top - delta`), so
-        // after a large top-edge resize the edge could never be moved back. And
-        // a step that would cross the limit was dropped entirely instead of
-        // stopping at the limit.
-        //
-        // Note: the limit cannot account for changes made to adjacent containers,
-        // so callers that can (like mouse_drag) should also validate the result.
-        const MIN_TILE_SIZE: i32 = 100;
-        let width_limit = (unaltered.right - MIN_TILE_SIZE).max(0) * 2;
-        let height_limit = (unaltered.bottom - MIN_TILE_SIZE).max(0) * 2;
-
-        let change = match sizing {
-            Sizing::Increase => delta,
-            Sizing::Decrease => -delta,
-        };
-
+        // Bounds are the caller's concern: no tile may end up smaller than a tenth of the work
+        // area (or smaller than it already is), which depends on the neighbours, not on the
+        // container being resized
         match edge {
-            // Growing to the left/up means a more negative left/top adjustment
-            OperationDirection::Left => {
-                r.left = bounded_adjustment(r.left, -change, width_limit);
-            }
-            OperationDirection::Up => {
-                r.top = bounded_adjustment(r.top, -change, height_limit);
-            }
-            OperationDirection::Right => {
-                r.right = bounded_adjustment(r.right, change, width_limit);
-            }
-            OperationDirection::Down => {
-                r.bottom = bounded_adjustment(r.bottom, change, height_limit);
-            }
+            OperationDirection::Left => match sizing {
+                Sizing::Increase => r.left -= delta,
+                Sizing::Decrease => r.left += delta,
+            },
+            OperationDirection::Up => match sizing {
+                Sizing::Increase => r.top -= delta,
+                Sizing::Decrease => r.top += delta,
+            },
+            OperationDirection::Right => match sizing {
+                Sizing::Increase => r.right += delta,
+                Sizing::Decrease => r.right -= delta,
+            },
+            OperationDirection::Down => match sizing {
+                Sizing::Increase => r.bottom += delta,
+                Sizing::Decrease => r.bottom -= delta,
+            },
         };
 
         if r.eq(&Rect::default()) {
@@ -406,17 +429,3 @@ impl DefaultLayout {
 #[cfg(test)]
 #[path = "default_layout_tests.rs"]
 mod tests;
-
-/// Apply `change` to a resize adjustment, clamping its magnitude to `limit`.
-/// A change that moves the adjustment back towards zero is always allowed, so a
-/// resize can always be undone.
-const fn bounded_adjustment(current: i32, change: i32, limit: i32) -> i32 {
-    let next = current + change;
-    if next.abs() <= limit || next.abs() <= current.abs() {
-        next
-    } else if next < 0 {
-        -limit
-    } else {
-        limit
-    }
-}
