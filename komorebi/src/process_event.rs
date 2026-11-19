@@ -276,7 +276,28 @@ impl WindowManager {
             WindowManagerEvent::FocusChange(_, window)
             | WindowManagerEvent::Show(_, window)
             | WindowManagerEvent::MoveResizeEnd(_, window) => {
-                if let Some(monitor_idx) = self.monitor_idx_from_window(window) {
+                // A window that is about to be tiled for the first time goes where the user
+                // is (the monitor under the pointer, which mouse_follows_focus keeps on the
+                // focused one), not wherever Windows happened to open it: apps reopen on the
+                // primary monitor or where they last were. Floating windows (dialogs,
+                // fullscreen games) keep the monitor they are on.
+                let opens_new_tile = matches!(event, WindowManagerEvent::Show(_, _))
+                    && !self.known_hwnds.contains_key(&window.hwnd)
+                    && !self
+                        .monitors()
+                        .iter()
+                        .flat_map(|m| m.workspaces())
+                        .any(|ws| ws.contains_window(window.hwnd))
+                    && !window.should_float();
+
+                let monitor_idx = if opens_new_tile {
+                    self.monitor_idx_from_current_pos()
+                        .or_else(|| self.monitor_idx_from_window(window))
+                } else {
+                    self.monitor_idx_from_window(window)
+                };
+
+                if let Some(monitor_idx) = monitor_idx {
                     // This is a hidden window apparently associated with COM support mechanisms (based
                     // on a post from http://www.databaseteam.org/1-ms-sql-server/a5bb344836fb889c.htm)
                     //
