@@ -1061,7 +1061,9 @@ impl WindowManager {
                     && monitor_idx != self.focused_monitor_idx()
                     && let Some(monitor) = self.monitors().get(monitor_idx)
                     && let Some(workspace) = monitor.focused_workspace()
-                    && (workspace.is_empty() || crate::window::WORKSPACE_FOLLOWS_CURSOR.load(std::sync::atomic::Ordering::SeqCst))
+                    && (workspace.is_empty()
+                        || crate::window::WORKSPACE_FOLLOWS_CURSOR
+                            .load(std::sync::atomic::Ordering::SeqCst))
                 {
                     self.focus_monitor(monitor_idx)?;
                 }
@@ -1087,7 +1089,9 @@ impl WindowManager {
                     && monitor_idx != self.focused_monitor_idx()
                     && let Some(monitor) = self.monitors().get(monitor_idx)
                     && let Some(workspace) = monitor.focused_workspace()
-                    && (workspace.is_empty() || crate::window::WORKSPACE_FOLLOWS_CURSOR.load(std::sync::atomic::Ordering::SeqCst))
+                    && (workspace.is_empty()
+                        || crate::window::WORKSPACE_FOLLOWS_CURSOR
+                            .load(std::sync::atomic::Ordering::SeqCst))
                 {
                     self.focus_monitor(monitor_idx)?;
                 }
@@ -1171,7 +1175,9 @@ impl WindowManager {
                     && monitor_idx != self.focused_monitor_idx()
                     && let Some(monitor) = self.monitors().get(monitor_idx)
                     && let Some(workspace) = monitor.focused_workspace()
-                    && (workspace.is_empty() || crate::window::WORKSPACE_FOLLOWS_CURSOR.load(std::sync::atomic::Ordering::SeqCst))
+                    && (workspace.is_empty()
+                        || crate::window::WORKSPACE_FOLLOWS_CURSOR
+                            .load(std::sync::atomic::Ordering::SeqCst))
                 {
                     self.focus_monitor(monitor_idx)?;
                 }
@@ -1199,7 +1205,9 @@ impl WindowManager {
                     && monitor_idx != self.focused_monitor_idx()
                     && let Some(monitor) = self.monitors().get(monitor_idx)
                     && let Some(workspace) = monitor.focused_workspace()
-                    && (workspace.is_empty() || crate::window::WORKSPACE_FOLLOWS_CURSOR.load(std::sync::atomic::Ordering::SeqCst))
+                    && (workspace.is_empty()
+                        || crate::window::WORKSPACE_FOLLOWS_CURSOR
+                            .load(std::sync::atomic::Ordering::SeqCst))
                 {
                     self.focus_monitor(monitor_idx)?;
                 }
@@ -1216,7 +1224,9 @@ impl WindowManager {
                     && monitor_idx != self.focused_monitor_idx()
                     && let Some(monitor) = self.monitors().get(monitor_idx)
                     && let Some(workspace) = monitor.focused_workspace()
-                    && (workspace.is_empty() || crate::window::WORKSPACE_FOLLOWS_CURSOR.load(std::sync::atomic::Ordering::SeqCst))
+                    && (workspace.is_empty()
+                        || crate::window::WORKSPACE_FOLLOWS_CURSOR
+                            .load(std::sync::atomic::Ordering::SeqCst))
                 {
                     self.focus_monitor(monitor_idx)?;
                 }

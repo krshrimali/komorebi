@@ -161,7 +161,9 @@ impl Dib {
         let pixels = (self.w * self.h) as usize;
         let at = |i: usize| unsafe { *(self.bits as *const u32).add(i) } & 0x00ff_ffff;
         let first = at(0);
-        (0..pixels).step_by((pixels / 997).max(1)).all(|i| at(i) == first)
+        (0..pixels)
+            .step_by((pixels / 997).max(1))
+            .all(|i| at(i) == first)
     }
 }
 
@@ -232,16 +234,10 @@ fn capture_window(h: isize, frame: Rect) -> Option<Pixels> {
     }
 
     let dib = Dib::new(window.w(), window.h())?;
-    let printed =
-        unsafe { PrintWindow(hwnd(h), dib.dc, PRINT_WINDOW_FLAGS(PW_RENDERFULLCONTENT)) };
+    let printed = unsafe { PrintWindow(hwnd(h), dib.dc, PRINT_WINDOW_FLAGS(PW_RENDERFULLCONTENT)) };
     if !printed.as_bool() || dib.is_blank() {
         return None;
     }
 
-    Some(dib.crop(
-        frame.l - window.l,
-        frame.t - window.t,
-        frame.w(),
-        frame.h(),
-    ))
+    Some(dib.crop(frame.l - window.l, frame.t - window.t, frame.w(), frame.h()))
 }

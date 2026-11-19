@@ -594,8 +594,9 @@ impl WindowsApi {
     /// raising a window over the foreground one, which Windows ignores when it is not asked
     /// by the foreground process, this is allowed.
     pub fn place_below(hwnd: isize, above: isize) -> eyre::Result<()> {
-        let flags =
-            SetWindowPosition::NO_MOVE | SetWindowPosition::NO_SIZE | SetWindowPosition::NO_ACTIVATE;
+        let flags = SetWindowPosition::NO_MOVE
+            | SetWindowPosition::NO_SIZE
+            | SetWindowPosition::NO_ACTIVATE;
 
         Self::set_window_pos(
             HWND(as_ptr!(hwnd)),

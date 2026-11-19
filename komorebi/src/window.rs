@@ -70,8 +70,7 @@ pub static WORKSPACE_FOLLOWS_CURSOR: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// Hyprland-style automatic floating of dialogs and fixed-size windows
-pub static FLOAT_DIALOGS: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+pub static FLOAT_DIALOGS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[derive(Debug, Default, Clone, Copy, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]

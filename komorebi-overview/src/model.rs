@@ -63,7 +63,10 @@ fn ring(v: &Value) -> (&[Value], usize) {
 }
 
 fn hwnd(window: &Value) -> Option<isize> {
-    window.get("hwnd").and_then(Value::as_i64).map(|h| h as isize)
+    window
+        .get("hwnd")
+        .and_then(Value::as_i64)
+        .map(|h| h as isize)
 }
 
 /// The visible window of a container (its focused one, for stacks)

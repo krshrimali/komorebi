@@ -81,9 +81,9 @@ use windows::Win32::UI::WindowsAndMessaging::WS_THICKFRAME;
 use crate::Window;
 use crate::animation::ANIMATION_ENABLED_GLOBAL;
 use crate::core::Layout;
+use crate::core::OperationDirection;
 use crate::core::Rect;
 use crate::core::Sizing;
-use crate::core::OperationDirection;
 use crate::window_manager::WindowManager;
 use crate::window_manager_event::WindowManagerEvent;
 use crate::winevent::WinEvent;
@@ -214,9 +214,20 @@ enum DragOp {
 
 #[derive(Copy, Clone, Debug)]
 enum DragMessage {
-    Begin { hwnd: isize, op: DragOp, x: i32, y: i32 },
-    Motion { x: i32, y: i32 },
-    End { x: i32, y: i32 },
+    Begin {
+        hwnd: isize,
+        op: DragOp,
+        x: i32,
+        y: i32,
+    },
+    Motion {
+        x: i32,
+        y: i32,
+    },
+    End {
+        x: i32,
+        y: i32,
+    },
 }
 
 fn channel() -> &'static (Sender<DragMessage>, Receiver<DragMessage>) {
@@ -569,8 +580,8 @@ impl Drag {
             // the latest cursor position instead of replaying a backlog of
             // posted moves (which made it trail the cursor by hundreds of px).
             // Hung apps get the async variant so the drag never freezes.
-            let hung = unsafe { IsHungAppWindow(HWND(self.hwnd as *mut core::ffi::c_void)) }
-                .as_bool();
+            let hung =
+                unsafe { IsHungAppWindow(HWND(self.hwnd as *mut core::ffi::c_void)) }.as_bool();
             self.apply_window(x, y, hung);
             return;
         }
@@ -723,17 +734,18 @@ const fn pick_edge(near_negative: bool, negative_ok: bool, positive_ok: bool) ->
 /// the right container, without waiting for the OS focus event) and return
 /// its layout rect and which of its edges can be resized.
 fn prepare_tiled(wm: &mut WindowManager, hwnd: isize) -> Option<Tiled> {
-    let (monitor_idx, container_idx) = wm.monitors().iter().enumerate().find_map(|(m, monitor)| {
-        let workspace = monitor.focused_workspace()?;
-        if !workspace.tile
-            || workspace.monocle_container.is_some()
-            || workspace.maximized_window.is_some()
-        {
-            return None;
-        }
+    let (monitor_idx, container_idx) =
+        wm.monitors().iter().enumerate().find_map(|(m, monitor)| {
+            let workspace = monitor.focused_workspace()?;
+            if !workspace.tile
+                || workspace.monocle_container.is_some()
+                || workspace.maximized_window.is_some()
+            {
+                return None;
+            }
 
-        workspace.container_idx_for_window(hwnd).map(|c| (m, c))
-    })?;
+            workspace.container_idx_for_window(hwnd).map(|c| (m, c))
+        })?;
 
     wm.focus_monitor(monitor_idx).ok()?;
     let workspace = wm.focused_workspace_mut().ok()?;

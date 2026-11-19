@@ -5,8 +5,8 @@ use windows::Win32::Foundation::GENERIC_READ;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F;
 use windows::Win32::Graphics::Direct2D::Common::D2D_SIZE_U;
-use windows::Win32::Graphics::Direct2D::Common::D2D1_ALPHA_MODE_PREMULTIPLIED;
 use windows::Win32::Graphics::Direct2D::Common::D2D1_ALPHA_MODE_IGNORE;
+use windows::Win32::Graphics::Direct2D::Common::D2D1_ALPHA_MODE_PREMULTIPLIED;
 use windows::Win32::Graphics::Direct2D::Common::D2D1_BORDER_MODE_HARD;
 use windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F;
 use windows::Win32::Graphics::Direct2D::Common::D2D1_COMPOSITE_MODE_SOURCE_OVER;
@@ -388,7 +388,9 @@ impl Gfx {
                 return 0.0;
             };
             let utf16: Vec<u16> = text.encode_utf16().collect();
-            let Ok(layout) = self.dwrite.CreateTextLayout(&utf16, &format, 10000.0, 1000.0)
+            let Ok(layout) = self
+                .dwrite
+                .CreateTextLayout(&utf16, &format, 10000.0, 1000.0)
             else {
                 return 0.0;
             };
@@ -440,4 +442,3 @@ pub fn wallpaper_path() -> Option<String> {
     let path = String::from_utf16_lossy(&buf[..len]);
     (!path.is_empty() && std::path::Path::new(&path).exists()).then_some(path)
 }
-

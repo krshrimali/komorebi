@@ -58,7 +58,9 @@ fn keep_floating_windows_above(tile: isize, floating: &[isize]) {
     let mut above = lowest;
     if let Some(border) = crate::border_manager::window_border(tile) {
         if let Err(error) = WindowsApi::place_below(border.border_hwnd, above) {
-            tracing::debug!("could not place the border of {tile} below the floating windows: {error}");
+            tracing::debug!(
+                "could not place the border of {tile} below the floating windows: {error}"
+            );
         } else {
             above = border.border_hwnd;
         }
@@ -158,7 +160,10 @@ pub fn listen_for_events(wm: Arc<Mutex<WindowManager>>) {
 
                 let elapsed = started.elapsed();
                 if elapsed.as_millis() >= 50 {
-                    tracing::warn!("slow event: {title} took {}ms to process", elapsed.as_millis());
+                    tracing::warn!(
+                        "slow event: {title} took {}ms to process",
+                        elapsed.as_millis()
+                    );
                 }
 
                 if receiver.len() >= 64 {
@@ -545,8 +550,7 @@ impl WindowManager {
                 {
                     tracing::info!("ignoring uncloak after monocle move by mouse across monitors");
                     self.uncloack_to_ignore = self.uncloack_to_ignore.saturating_sub(1);
-                } else if !matches!(event, WindowManagerEvent::Manage(_)) && window.is_miminized()
-                {
+                } else if !matches!(event, WindowManagerEvent::Manage(_)) && window.is_miminized() {
                     // Windows can fire SystemMinimizeEnd (and Show/Uncloak) for a window that
                     // is still iconic, e.g. when ShowWindow(SW_MINIMIZE) is called on an
                     // already-minimized window. Tiling it would leave an empty hole in the

@@ -4003,13 +4003,16 @@ impl WindowManager {
             });
 
         let location = indexed.or_else(|| {
-            self.monitors().iter().enumerate().find_map(|(m_idx, monitor)| {
-                monitor
-                    .workspaces()
-                    .iter()
-                    .position(|w| w.contains_window(hwnd))
-                    .map(|w_idx| (m_idx, w_idx))
-            })
+            self.monitors()
+                .iter()
+                .enumerate()
+                .find_map(|(m_idx, monitor)| {
+                    monitor
+                        .workspaces()
+                        .iter()
+                        .position(|w| w.contains_window(hwnd))
+                        .map(|w_idx| (m_idx, w_idx))
+                })
         });
 
         let Some((m_idx, w_idx)) = location else {
